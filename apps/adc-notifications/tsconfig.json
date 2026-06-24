@@ -1,0 +1,17 @@
+{
+	"extends": "../../../../tsconfig.base.json",
+	"compilerOptions": {
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"jsx": "react-jsx",
+		"paths": {
+			"@adc/utils/*": ["./../../../../src/utils/*"],
+			"@apps/*": ["./../../../../src/apps/*"],
+			"@ui-library/utils/*": ["./../../../../src/apps/public/00-adc-ui-library/utils/*"],
+			"@ui-library/*": ["./../../../../src/apps/public/00-adc-ui-library/src/*"],
+			"@common/*": ["./../../../../src/common/*"]
+		},
+		"typeRoots": ["./node_modules/@types", "../../../../node_modules/@types"]
+	},
+	"include": ["src/**/*", "*.ts", "./../../../../src/apps/public/00-adc-ui-library/utils/react-jsx.d.ts"]
+}

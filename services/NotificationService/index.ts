@@ -1,0 +1,320 @@
+import type MongoProvider from "@providers/object/mongo/index.js";
+import type RabbitMQProvider from "@providers/queue/rabbitmq/index.js";
+import type { IHostBasedHttpProvider } from "@interfaces/modules/providers/IHttpServer.d.ts";
+import { BaseService } from "@services/BaseService.js";
+import { Kernel } from "@kernel";
+import { NOTIFY_SERVICE, NOTIFY_OPERATION } from "@common/utils/notifications/emit.ts";
+import type IdentityManagerService from "@services/core/IdentityManagerService/index.js";
+import { EnableEndpoints, DisableEndpoints } from "@services/core/EndpointManagerService/index.js";
+import { OnlyKernel } from "@adc/utils/decorators/OnlyKernel.ts";
+import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
+import type { INotificationService, INotificationEmailSender } from "@common/types/notifications/INotificationService.ts";
+import type { Notification, NotificationPreference, NotifyInput } from "@common/types/notifications/Notification.ts";
+import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
+
+import { notificationSchema, preferenceSchema } from "./domain/index.ts";
+import { NotificationManager, PreferenceManager } from "./dao/index.ts";
+import { SYSTEM_TOPIC_TEMPLATES, isReservedTopic, RateLimiter } from "./policy.ts";
+import { SseHub } from "./sse/SseHub.ts";
+import { registerSseRoute } from "./sse/registerSseRoute.ts";
+import { NotificationEndpoints } from "./endpoints/notifications.ts";
+import { PreferenceEndpoints } from "./endpoints/preferences.ts";
+
+const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Servicio de notificaciones: bandeja por usuario (Mongo, base `adc-notifications`),
+ * preferencias por topic/canal, entrega en tiempo real por SSE y canal email
+ * opcional (si `EmailService` está cargado). Productores emiten vía `notify()`.
+ */
+export default class NotificationService extends BaseService implements INotificationService {
+	public readonly name = "NotificationService";
+
+	#mongo!: MongoProvider;
+	#rabbit: RabbitMQProvider | null = null;
+	#identity: IdentityManagerService | null = null;
+	#sessionVerifier: ISessionVerifier | null = null;
+
+	#notifications: NotificationManager | null = null;
+	#preferences: PreferenceManager | null = null;
+	#hub: SseHub | null = null;
+
+	#systemFrom = "no-reply@adigitalcafe.com";
+	#retentionDays = 90;
+	#purgeTimer: NodeJS.Timeout | null = null;
+
+	// Anti-flood por (usuario, topic): general laxo; reservados (security.*) estricto.
+	readonly #generalLimiter = new RateLimiter(30, 60_000);
+	readonly #securityLimiter = new RateLimiter(5, 3_600_000);
+
+	readonly #kernelRef: Kernel;
+
+	constructor(kernel: Kernel, options?: ConstructorParameters<typeof BaseService>[1]) {
+		super(kernel, options);
+		this.#kernelRef = kernel;
+	}
+
+	@EnableEndpoints({ managers: () => [NotificationEndpoints, PreferenceEndpoints] })
+	async start(kernelKey: symbol): Promise<void> {
+		await super.start(kernelKey);
+
+		this.#mongo = this.getMyProvider<MongoProvider>("object/mongo");
+		await this.#waitForMongo();
+
+		const priv = (this.config?.private ?? {}) as Record<string, string | undefined>;
+		const dbName = priv.dbName || "adc-notifications";
+		this.#systemFrom = priv.systemFrom || this.#systemFrom;
+		this.#retentionDays = Number(priv.retentionDays || 90) || 90;
+
+		// Vista lógica aislada sobre la conexión Mongo de la plataforma.
+		const db = this.#mongo.useDb(this.#mongo.getConnection(), dbName);
+		const NotificationModel = this.#mongo.createModelForDb<Notification>(db, "notifications", notificationSchema);
+		const PreferenceModel = this.#mongo.createModelForDb<NotificationPreference>(db, "notification_preferences", preferenceSchema);
+
+		this.#notifications = new NotificationManager(NotificationModel);
+		this.#preferences = new PreferenceManager(PreferenceModel);
+		this.#hub = new SseHub(this.logger);
+
+		this.#identity = this.#kernelRef.registry.getService<IdentityManagerService>("IdentityManagerService");
+
+		// Endpoint SSE sobre el socket crudo (no encaja en @RegisterEndpoint).
+		const httpProvider = this.getMyProvider<IHostBasedHttpProvider>("fastify-server");
+		registerSseRoute({
+			httpProvider,
+			hub: this.#hub,
+			getVerifier: () => this.#getSessionVerifier(),
+			getUnreadCount: (userId: string) => this.notifications.unreadCount(userId),
+			logger: this.logger,
+		});
+
+		NotificationEndpoints.init(this, kernelKey);
+		PreferenceEndpoints.init(this, kernelKey);
+
+		// Cola durable: los productores publican aquí vía `emitNotification`; si este
+		// servicio está en mantenimiento, los mensajes se acumulan y se entregan al
+		// reconectar el consumidor (entrega eventual). Degradación: sin cola, los
+		// productores caen a entrega directa vía `notify()`.
+		await this.#setupQueueConsumer();
+
+		this.#startPurgeScheduler();
+		this.logger.logOk("NotificationService iniciado");
+	}
+
+	@DisableEndpoints()
+	async stop(kernelKey: symbol): Promise<void> {
+		await super.stop(kernelKey);
+		if (this.#purgeTimer) clearInterval(this.#purgeTimer);
+		this.#purgeTimer = null;
+		this.#hub?.stop();
+		this.logger.logOk("NotificationService detenido");
+	}
+
+	// ─── API de productores (INotificationService) ──────────────────────────
+	/**
+	 * Entrega directa de una notificación (canal inApp + email/push según prefs).
+	 * Es la implementación de `INotificationService.notify`: la usa el fallback
+	 * síncrono de `emitNotification` cuando la cola no está disponible, y también
+	 * el consumidor de la cola (vía `#deliver`). Preferí **`emitNotification`** en
+	 * los productores (desacoplado y durable) en vez de llamar esto directo.
+	 */
+	async notify(input: NotifyInput): Promise<void> {
+		return this.#deliver(input);
+	}
+
+	/**
+	 * Política de seguridad en el choke point de entrega (cubre cola + entrega directa):
+	 *  1. **Topics reservados** (`security.*`): deben tener plantilla declarada y el
+	 *     `origin` del productor debe estar allowlisted; si no, se descarta (anti-spoofing).
+	 *     El contenido (title/body/link/channels) se **renderiza desde el servidor**, así
+	 *     un productor no puede inyectar texto de phishing bajo un topic creíble.
+	 *  2. **Rate-limit** por (usuario, topic): estricto para reservados, laxo para el resto.
+	 *
+	 * @returns el input efectivo a entregar, o `null` si debe descartarse.
+	 */
+	#applyPolicy(input: NotifyInput): NotifyInput | null {
+		const { topic } = input;
+		let effective = input;
+
+		if (isReservedTopic(topic)) {
+			const tpl = SYSTEM_TOPIC_TEMPLATES[topic];
+			if (!tpl) {
+				this.logger.logWarn(`notify: topic reservado desconocido '${topic}' descartado (origen=${input.origin ?? "?"})`);
+				return null;
+			}
+			if (!tpl.allowedOrigins.includes(input.origin ?? "")) {
+				this.logger.logWarn(`notify: origen '${input.origin ?? "?"}' no autorizado para '${topic}'; descartado (posible spoofing)`);
+				return null;
+			}
+			// Contenido canónico del servidor: ignoramos title/body/link/channels del productor.
+			effective = {
+				userId: input.userId,
+				topic,
+				title: tpl.title,
+				body: tpl.body,
+				channels: tpl.channels ?? input.channels,
+				linkApp: tpl.linkApp,
+				link: tpl.link,
+				data: input.data,
+				collapseUnread: input.collapseUnread,
+			};
+		}
+
+		const limiter = isReservedTopic(topic) ? this.#securityLimiter : this.#generalLimiter;
+		if (!limiter.allow(`${input.userId}:${topic}`)) {
+			this.logger.logDebug(`notify: rate-limit excedido (${input.userId} topic=${topic}); descartado`);
+			return null;
+		}
+		return effective;
+	}
+
+	/** Persiste (inApp), empuja por SSE y dispara email/push según preferencias. */
+	async #deliver(rawInput: NotifyInput): Promise<void> {
+		const input = this.#applyPolicy(rawInput);
+		if (!input) return;
+
+		const channels = await this.preferences.resolveChannels(input.userId, input.topic, input.channels);
+		if (channels.length === 0) return;
+
+		if (channels.includes("inApp")) {
+			// Digest: si ya hay una no leída del mismo topic, no apilamos otra.
+			const collapse = input.collapseUnread && (await this.notifications.hasUnreadForTopic(input.userId, input.topic));
+			if (!collapse) {
+				const notification = await this.notifications.create(input, channels);
+				const unread = await this.notifications.unreadCount(input.userId);
+				this.#hub?.publishToUser(input.userId, { type: "notification", unread, notification });
+			}
+		}
+
+		if (channels.includes("email")) {
+			await this.#deliverEmail(input).catch((e) =>
+				this.logger.logWarn(`notify: canal email falló para ${input.userId}: ${(e as Error).message}`)
+			);
+		}
+
+		// channel "push": modelado (queda persistido en el registro) pero entregado
+		// por Web Push en una fase futura. Hoy es no-op.
+	}
+
+	/** Marca una notificación como leída y sincroniza el conteo por SSE. */
+	async markRead(userId: string, id: string): Promise<number> {
+		const unread = await this.notifications.markRead(userId, id);
+		this.#hub?.publishToUser(userId, { type: "read", unread });
+		return unread;
+	}
+
+	/** Marca todas como leídas y sincroniza por SSE. */
+	async markAllRead(userId: string): Promise<void> {
+		await this.notifications.markAllRead(userId);
+		this.#hub?.publishToUser(userId, { type: "read", unread: 0 });
+	}
+
+	// ─── Accesores para endpoints ───────────────────────────────────────────
+	get notifications(): NotificationManager {
+		if (!this.#notifications) throw new NotificationError(503, "TRANSPORT_UNAVAILABLE", "Notificaciones no inicializadas");
+		return this.#notifications;
+	}
+	get preferences(): PreferenceManager {
+		if (!this.#preferences) throw new NotificationError(503, "TRANSPORT_UNAVAILABLE", "Preferencias no inicializadas");
+		return this.#preferences;
+	}
+
+	/**
+	 * Purga en cascada las notificaciones y preferencias de un usuario tras expirar
+	 * su retención (invocado por IdentityManagerService). Protegido por `@OnlyKernel()`.
+	 */
+	@OnlyKernel()
+	async purgeUserData(_kernelKey: symbol, userId: string): Promise<void> {
+		if (!userId) return;
+		const removed = await this.notifications.purgeByUser(userId).catch(() => 0);
+		await this.preferences.purgeByUser(userId).catch(() => 0);
+		this.logger.logInfo(`Purga notificaciones: usuario ${userId} → ${removed} notificación(es) eliminadas`);
+	}
+
+	// ─── Internos ───────────────────────────────────────────────────────────
+	/** Verificador de sesión lazy (la campana manda la cookie de sesión al SSE). */
+	#getSessionVerifier(): ISessionVerifier | null {
+		if (!this.#sessionVerifier) {
+			try {
+				this.#sessionVerifier = this.#kernelRef.registry.getService<ISessionVerifier>("SessionManagerService");
+			} catch {
+				// SessionManagerService no disponible: el SSE responderá 503.
+			}
+		}
+		return this.#sessionVerifier;
+	}
+
+	/** EmailService si está cargado e implementa `sendSystemEmail` (duck-typing). */
+	#getEmailSender(): INotificationEmailSender | null {
+		if (!this.#kernelRef.registry.hasModule("service", "EmailService")) return null;
+		try {
+			const svc = this.#kernelRef.registry.getService<Partial<INotificationEmailSender>>("EmailService");
+			if (svc && typeof svc.sendSystemEmail === "function") return svc as INotificationEmailSender;
+		} catch {
+			// EmailService no disponible.
+		}
+		return null;
+	}
+
+	async #deliverEmail(input: NotifyInput): Promise<void> {
+		const sender = this.#getEmailSender();
+		if (!sender) return; // EmailService ausente o sin sendSystemEmail: se omite el canal.
+		const email = await this.#resolveUserEmail(input.userId);
+		if (!email) return;
+		const subject = input.email?.subject ?? input.title;
+		const html = input.email?.html ?? this.#defaultEmailHtml(input);
+		await sender.sendSystemEmail({ to: email, subject, html, text: input.body });
+	}
+
+	async #resolveUserEmail(userId: string): Promise<string | null> {
+		try {
+			const user = await this.#identity?.users.getUser(userId);
+			return user?.email ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	#defaultEmailHtml(input: NotifyInput): string {
+		const safe = (s: string) => s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c] ?? c);
+		const cta = input.link
+			? `<p><a href="${input.link}" style="display:inline-block;padding:10px 16px;background:#5b5bd6;color:#fff;border-radius:8px;text-decoration:none">Ver</a></p>`
+			: "";
+		return `<div style="font-family:system-ui,sans-serif"><h2>${safe(input.title)}</h2><p>${safe(input.body)}</p>${cta}</div>`;
+	}
+
+	/** Declara la topología durable y consume los mensajes encolados por los productores. */
+	async #setupQueueConsumer(): Promise<void> {
+		try {
+			this.#rabbit = this.getMyProvider<RabbitMQProvider>("queue/rabbitmq");
+			await this.#rabbit.declareOperationTopology(NOTIFY_SERVICE, NOTIFY_OPERATION);
+			this.#rabbit.createOperationConsumer(NOTIFY_SERVICE, NOTIFY_OPERATION, async (msg) => {
+				await this.#deliver(msg.body as unknown as NotifyInput);
+			});
+			this.logger.logOk("NotificationService: consumidor de cola activo (entrega durable)");
+		} catch (e) {
+			this.#rabbit = null;
+			this.logger.logWarn(`Cola de notificaciones no disponible; solo entrega directa: ${(e as Error).message}`);
+		}
+	}
+
+	#startPurgeScheduler(): void {
+		this.#purgeTimer = setInterval(() => {
+			void this.notifications
+				.purgeExpired(this.#retentionDays)
+				.then((n) => {
+					if (n > 0) this.logger.logDebug(`Purga notificaciones: ${n} leídas expiradas eliminadas`);
+				})
+				.catch((e) => this.logger.logWarn(`Purga notificaciones falló: ${(e as Error).message}`));
+		}, PURGE_INTERVAL_MS);
+		this.#purgeTimer.unref?.();
+	}
+
+	async #waitForMongo(): Promise<void> {
+		const maxWaitTime = 10_000;
+		const startTime = Date.now();
+		while (!this.#mongo.isConnected() && Date.now() - startTime < maxWaitTime) {
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+		if (!this.#mongo.isConnected()) throw new Error("MongoDB no pudo conectarse en el tiempo esperado");
+	}
+}

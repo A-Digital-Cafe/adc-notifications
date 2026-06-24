@@ -1,0 +1,46 @@
+{
+	"name": "NotificationService",
+	"version": "1.0.0",
+	"kernelMode": 80,
+	"failOnError": false,
+	"private": {
+		"dbName": "${NOTIFICATIONS_DB_NAME:-adc-notifications}",
+		"retentionDays": "${NOTIFICATIONS_RETENTION_DAYS:-365}",
+		"systemFrom": "${NOTIFICATIONS_SYSTEM_FROM:-no-reply@adigitalcafe.com}"
+	},
+	"providers": [
+		{
+			"name": "object/mongo",
+			"version": "latest",
+			"language": "typescript",
+			"custom": {
+				"uri": "mongodb://admin:password@localhost:27017/adc-core?authSource=admin",
+				"maxRetries": 5,
+				"retryDelay": 5000
+			}
+		},
+		{
+			"name": "fastify-server",
+			"version": "latest",
+			"language": "typescript"
+		},
+		{
+			"name": "queue/rabbitmq",
+			"version": "latest",
+			"language": "typescript",
+			"custom": {
+				"url": "amqp://admin:password@localhost:5672",
+				"defaultPrefetch": 10,
+				"defaultConcurrency": 5,
+				"maxRetries": 4,
+				"retryDelaysMs": [1000, 5000, 25000, 125000]
+			}
+		}
+	],
+	"services": [
+		{ "name": "IdentityManagerService", "version": "latest" },
+		{ "name": "EndpointManagerService", "version": "latest" },
+		{ "name": "SessionManagerService", "version": "latest", "optional": true },
+		{ "name": "EmailService", "version": "latest", "optional": true }
+	]
+}

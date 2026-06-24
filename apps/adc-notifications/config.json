@@ -1,0 +1,27 @@
+{
+	"uiModule": {
+		"name": "adc-notifications",
+		"uiNamespace": "adc-platform",
+		"framework": "react",
+		"outputDir": "dist-ui",
+		"isHost": true,
+		"isRemote": false,
+		"serviceWorker": true,
+		"uiDependencies": ["adc-ui-library"],
+		"devPort": 3036,
+		"sharedLibs": ["react", "tailwind"],
+		"i18n": false,
+		"security": {
+			"headers": {
+				"Content-Security-Policy-Extend": "img-src https:"
+			}
+		},
+		"hosting": [
+			{
+				"domains": ["adigitalcafe.com"],
+				"subdomains": ["notifications"]
+			}
+		]
+	},
+	"services": []
+}

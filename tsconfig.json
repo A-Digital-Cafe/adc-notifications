@@ -1,0 +1,29 @@
+{
+	"compilerOptions": {
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"esModuleInterop": true,
+		"allowImportingTsExtensions": true,
+		"allowSyntheticDefaultImports": true,
+		"skipLibCheck": true,
+		"strict": true,
+		"types": ["node"],
+		"target": "ES2022",
+		"lib": ["es2022", "dom", "dom.iterable"],
+		"noEmit": true,
+		"experimentalDecorators": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"paths": {
+			"@common/*": ["../../src/common/*"],
+			"@apps/*": ["../../src/apps/*"],
+			"@services/*": ["../../src/services/*"],
+			"@providers/*": ["../../src/providers/*"],
+			"@utilities/*": ["../../src/utilities/*"],
+			"@interfaces/*": ["../../src/interfaces/*"],
+			"@adc/utils/*": ["../../src/utils/*"],
+			"@kernel": ["../../src/kernel.ts"]
+		}
+	},
+	"include": ["services/**/*.ts", "../../globals.d.ts"]
+}
