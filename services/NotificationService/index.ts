@@ -4,7 +4,7 @@ import type { IHostBasedHttpProvider } from "@interfaces/modules/providers/IHttp
 import { BaseService } from "@services/BaseService.js";
 import { Kernel } from "@kernel";
 import { NOTIFY_SERVICE, NOTIFY_OPERATION } from "@common/utils/notifications/emit.ts";
-import type IdentityManagerService from "@services/core/IdentityManagerService/index.js";
+import type { IIdentityManagerService } from "@common/types/identity/IIdentityManagerService.js";
 import { EnableEndpoints, DisableEndpoints } from "@services/core/EndpointManagerService/index.js";
 import { OnlyKernel } from "@adc/utils/decorators/OnlyKernel.ts";
 import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
@@ -32,7 +32,7 @@ export default class NotificationService extends BaseService implements INotific
 
 	#mongo!: MongoProvider;
 	#rabbit: RabbitMQProvider | null = null;
-	#identity: IdentityManagerService | null = null;
+	#identity: IIdentityManagerService | null = null;
 	#sessionVerifier: ISessionVerifier | null = null;
 
 	#notifications: NotificationManager | null = null;
@@ -47,11 +47,8 @@ export default class NotificationService extends BaseService implements INotific
 	readonly #generalLimiter = new RateLimiter(30, 60_000);
 	readonly #securityLimiter = new RateLimiter(5, 3_600_000);
 
-	readonly #kernelRef: Kernel;
-
 	constructor(kernel: Kernel, options?: ConstructorParameters<typeof BaseService>[1]) {
 		super(kernel, options);
-		this.#kernelRef = kernel;
 	}
 
 	@EnableEndpoints({ managers: () => [NotificationEndpoints, PreferenceEndpoints] })
@@ -75,7 +72,7 @@ export default class NotificationService extends BaseService implements INotific
 		this.#preferences = new PreferenceManager(PreferenceModel);
 		this.#hub = new SseHub(this.logger);
 
-		this.#identity = this.#kernelRef.registry.getService<IdentityManagerService>("IdentityManagerService");
+		this.#identity = this.getMyService<IIdentityManagerService>("IdentityManagerService");
 
 		// Endpoint SSE sobre el socket crudo (no encaja en @RegisterEndpoint).
 		const httpProvider = this.getMyProvider<IHostBasedHttpProvider>("fastify-server");
@@ -220,7 +217,7 @@ export default class NotificationService extends BaseService implements INotific
 
 	/**
 	 * Purga en cascada las notificaciones y preferencias de un usuario tras expirar
-	 * su retención (invocado por IdentityManagerService). Protegido por `@OnlyKernel()`.
+	 * su retención (invocado por IIdentityManagerService). Protegido por `@OnlyKernel()`.
 	 */
 	@OnlyKernel()
 	async purgeUserData(_kernelKey: symbol, userId: string): Promise<void> {
@@ -233,25 +230,18 @@ export default class NotificationService extends BaseService implements INotific
 	// ─── Internos ───────────────────────────────────────────────────────────
 	/** Verificador de sesión lazy (la campana manda la cookie de sesión al SSE). */
 	#getSessionVerifier(): ISessionVerifier | null {
+		// SessionManagerService es dependencia declarada pero opcional en runtime (SSE → 503 si falta).
 		if (!this.#sessionVerifier) {
-			try {
-				this.#sessionVerifier = this.#kernelRef.registry.getService<ISessionVerifier>("SessionManagerService");
-			} catch {
-				// SessionManagerService no disponible: el SSE responderá 503.
-			}
+			this.#sessionVerifier = this.tryGetMyService<ISessionVerifier>("SessionManagerService") ?? null;
 		}
 		return this.#sessionVerifier;
 	}
 
 	/** EmailService si está cargado e implementa `sendSystemEmail` (duck-typing). */
 	#getEmailSender(): INotificationEmailSender | null {
-		if (!this.#kernelRef.registry.hasModule("service", "EmailService")) return null;
-		try {
-			const svc = this.#kernelRef.registry.getService<Partial<INotificationEmailSender>>("EmailService");
-			if (svc && typeof svc.sendSystemEmail === "function") return svc as INotificationEmailSender;
-		} catch {
-			// EmailService no disponible.
-		}
+		// EmailService es dependencia declarada pero opcional (duck-typing de `sendSystemEmail`).
+		const svc = this.tryGetMyService<Partial<INotificationEmailSender>>("EmailService");
+		if (svc && typeof svc.sendSystemEmail === "function") return svc as INotificationEmailSender;
 		return null;
 	}
 
