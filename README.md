@@ -1,4 +1,4 @@
-# adc-notifications
+# adc-notifications [![Security](https://github.com/A-Digital-Cafe/adc-notifications/actions/workflows/security.yml/badge.svg)](https://github.com/A-Digital-Cafe/adc-notifications/actions/workflows/security.yml)
 
 Preset de notificaciones de la plataforma ADC.
 
