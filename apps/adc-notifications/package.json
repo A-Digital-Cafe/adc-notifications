@@ -1,8 +1,9 @@
 {
-	"name": "@adc-platform/notification-service",
+	"name": "@adc-platform/adc-notifications",
 	"license": "LicenseRef-Proprietary",
 	"author": "abbytec",
 	"version": "1.0.0",
 	"private": true,
-	"type": "module"
+	"type": "module",
+	"dependencies": {}
 }
