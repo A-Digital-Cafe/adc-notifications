@@ -153,5 +153,16 @@ export default function App() {
 		);
 	}
 
-	return <adc-layout>{body}</adc-layout>;
+	// adc-layout (shadow:false) reposiciona físicamente su hijo slotted dentro de su <main>,
+	// por lo que su hijo directo debe ser un wrapper ESTABLE que React nunca remueva (si
+	// cambiase, React intentaría removerlo desde adc-layout y ya no es su hijo → removeChild).
+	// El remount por estado (loading/anon/ready) se hace en un div interno (nieto), que vive
+	// dentro del wrapper estable y React reconcilia sin problema (ver docs/architecture/ui-federation.md #2).
+	return (
+		<adc-layout>
+			<div>
+				<div key={status}>{body}</div>
+			</div>
+		</adc-layout>
+	);
 }
