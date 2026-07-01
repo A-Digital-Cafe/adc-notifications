@@ -1,5 +1,6 @@
 {
 	"name": "NotificationService",
+	"uiName": "Notificaciones",
 	"version": "1.0.0",
 	"kernelMode": 80,
 	"failOnError": false,

@@ -2,6 +2,7 @@
 	"uiModule": {
 		"name": "adc-notifications",
 		"uiNamespace": "adc-platform",
+		"uiName": "Notificaciones",
 		"framework": "react",
 		"outputDir": "dist-ui",
 		"isHost": true,
