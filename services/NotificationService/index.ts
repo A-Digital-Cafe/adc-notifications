@@ -3,16 +3,19 @@ import type RabbitMQProvider from "@providers/queue/rabbitmq/index.js";
 import type { IHostBasedHttpProvider } from "@interfaces/modules/providers/IHttpServer.d.ts";
 import { BaseService } from "@services/BaseService.js";
 import { Kernel } from "@kernel";
-import { NOTIFY_SERVICE, NOTIFY_OPERATION } from "@common/utils/notifications/emit.ts";
+import { NOTIFY_SERVICE, NOTIFY_OPERATION, NOTIFY_BROADCAST_OPERATION } from "@common/utils/notifications/emit.ts";
+import { forEachPage } from "@common/utils/batch.ts";
 import type { IIdentityManagerService } from "@common/types/identity/IIdentityManagerService.js";
 import { EnableEndpoints, DisableEndpoints } from "@services/core/EndpointManagerService/index.js";
 import { OnlyKernel } from "@adc/utils/decorators/OnlyKernel.ts";
 import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
 import type { INotificationService, INotificationEmailSender } from "@common/types/notifications/INotificationService.ts";
-import type { Notification, NotificationPreference, NotifyInput } from "@common/types/notifications/Notification.ts";
+import type { BroadcastInput, Notification, NotificationPreference, NotifyInput } from "@common/types/notifications/Notification.ts";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
+import { assertScope, Scope, type CapabilityToken } from "@common/security/Capability.ts";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
-import { notificationSchema, preferenceSchema } from "./domain/index.ts";
+import { notificationSchema, notificationSecretSchema, preferenceSchema, type NotificationSecret } from "./domain/index.ts";
 import { NotificationManager, PreferenceManager } from "./dao/index.ts";
 import { SYSTEM_TOPIC_TEMPLATES, isReservedTopic, RateLimiter } from "./policy.ts";
 import { SseHub } from "./sse/SseHub.ts";
@@ -21,6 +24,24 @@ import { NotificationEndpoints } from "./endpoints/notifications.ts";
 import { PreferenceEndpoints } from "./endpoints/preferences.ts";
 
 const PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/** Tamaño de página del fan-out de broadcasts (por chunk de cola y por página directa). */
+const BROADCAST_CHUNK = 50;
+
+/**
+ * Mensaje de la cola `broadcast`: el anuncio + el progreso del fan-out. Cada chunk
+ * procesa UNA página y re-publica con el cursor avanzado (reanudable, reintentos
+ * frescos por chunk). SOLO este servicio publica acá, firmando cada job: un mensaje
+ * inyectado por otro módulo no verifica y se descarta.
+ */
+interface BroadcastJob extends BroadcastInput {
+	/** Último userId procesado; ausente = primera página. */
+	cursor?: string | null;
+	/** Usuarios alcanzados por los chunks anteriores. */
+	delivered?: number;
+	/** HMAC-SHA256 (hex) del payload canónico. */
+	sig?: string;
+}
 
 /**
  * Servicio de notificaciones: bandeja por usuario (Mongo, base `adc-notifications`),
@@ -32,12 +53,13 @@ export default class NotificationService extends BaseService implements INotific
 
 	#mongo!: MongoProvider;
 	#rabbit: RabbitMQProvider | null = null;
-	#identity: IIdentityManagerService | null = null;
 	#sessionVerifier: ISessionVerifier | null = null;
 
 	#notifications: NotificationManager | null = null;
 	#preferences: PreferenceManager | null = null;
 	#hub: SseHub | null = null;
+	/** Secreto HMAC (persistido en mongo) con el que se firman los jobs de broadcast. */
+	#broadcastKey: Buffer | null = null;
 
 	#systemFrom = "no-reply@adigitalcafe.com";
 	#retentionDays = 90;
@@ -72,7 +94,14 @@ export default class NotificationService extends BaseService implements INotific
 		this.#preferences = new PreferenceManager(PreferenceModel);
 		this.#hub = new SseHub(this.logger);
 
-		this.#identity = this.getMyService<IIdentityManagerService>("IdentityManagerService");
+		// Secreto de firma de broadcasts: se crea una sola vez y persiste entre reinicios.
+		const SecretModel = this.#mongo.createModelForDb<NotificationSecret>(db, "notification_secrets", notificationSecretSchema);
+		const secret = await SecretModel.findOneAndUpdate(
+			{ _id: "broadcast-hmac" },
+			{ $setOnInsert: { key: randomBytes(32).toString("hex"), createdAt: new Date() } },
+			{ upsert: true, new: true }
+		).lean();
+		this.#broadcastKey = secret ? Buffer.from(secret.key, "hex") : null;
 
 		// Endpoint SSE sobre el socket crudo (no encaja en @RegisterEndpoint).
 		const httpProvider = this.getMyProvider<IHostBasedHttpProvider>("fastify-server");
@@ -102,6 +131,7 @@ export default class NotificationService extends BaseService implements INotific
 		await super.stop(kernelKey);
 		if (this.#purgeTimer) clearInterval(this.#purgeTimer);
 		this.#purgeTimer = null;
+		this.#broadcastKey = null;
 		this.#hub?.stop();
 		this.logger.logOk("NotificationService detenido");
 	}
@@ -116,6 +146,134 @@ export default class NotificationService extends BaseService implements INotific
 	 */
 	async notify(input: NotifyInput): Promise<void> {
 		return this.#deliver(input);
+	}
+
+	/**
+	 * Anuncio a TODOS los usuarios activos: la única puerta de entrada de broadcasts.
+	 * Exige el scope `notifications:broadcast` en la capability; con cola encola UN
+	 * job firmado (`queued`), sin cola hace fan-out directo (`direct`).
+	 */
+	async broadcast(cap: CapabilityToken, input: BroadcastInput): Promise<"queued" | "direct"> {
+		assertScope(cap, Scope.NotificationsBroadcast);
+		if (!input.broadcastId) throw new NotificationError(400, "MISSING_FIELDS", "broadcastId requerido");
+		if (this.#rabbit && this.#broadcastKey) {
+			await this.#publishBroadcastJob({ ...input, cursor: null, delivered: 0 });
+			return "queued";
+		}
+		await this.#directBroadcast(input);
+		return "direct";
+	}
+
+	// ─── Fan-out de broadcasts ──────────────────────────────────────────────
+	/** Payload canónico de la firma: los campos que definen el anuncio y su progreso. */
+	#broadcastPayload(job: BroadcastJob): string {
+		return JSON.stringify([
+			job.broadcastId,
+			job.topic,
+			job.title,
+			job.body,
+			job.link ?? null,
+			job.linkApp ?? null,
+			job.icon ?? null,
+			job.data ?? null,
+			job.cursor ?? null,
+			job.delivered ?? 0,
+		]);
+	}
+
+	#signBroadcastJob(job: BroadcastJob): string {
+		if (!this.#broadcastKey) throw new NotificationError(503, "TRANSPORT_UNAVAILABLE", "Clave de firma de broadcasts no inicializada");
+		return createHmac("sha256", this.#broadcastKey).update(this.#broadcastPayload(job)).digest("hex");
+	}
+
+	/** `true` sólo si el job trae una firma HMAC válida de ESTE servicio. */
+	#verifyBroadcastJob(job: BroadcastJob): boolean {
+		if (!this.#broadcastKey || !job.broadcastId || typeof job.sig !== "string") return false;
+		const expected = Buffer.from(this.#signBroadcastJob(job), "hex");
+		const actual = Buffer.from(job.sig, "hex");
+		return actual.length === expected.length && timingSafeEqual(actual, expected);
+	}
+
+	/** Firma y publica un job de broadcast en la cola durable. */
+	async #publishBroadcastJob(job: BroadcastJob): Promise<void> {
+		if (!this.#rabbit) throw new NotificationError(503, "TRANSPORT_UNAVAILABLE", "Cola de broadcasts no disponible");
+		const signed: BroadcastJob = { ...job, sig: this.#signBroadcastJob(job) };
+		await this.#rabbit.publish(NOTIFY_SERVICE, NOTIFY_BROADCAST_OPERATION, signed as unknown as Record<string, unknown>);
+	}
+
+	/** Fan-out inmediato sin cola (modo degradado de `broadcast()`). */
+	async #directBroadcast(input: BroadcastInput): Promise<void> {
+		let failed = 0;
+		const total = await forEachPage(
+			async (afterId, limit) => (await this.#fetchUserIdsPage(afterId, limit)).map((id) => ({ id })),
+			async (page) => {
+				failed += await this.#deliverBroadcastPage(
+					input,
+					page.map((u) => u.id)
+				);
+			},
+			BROADCAST_CHUNK
+		);
+		if (failed > 0) this.logger.logWarn(`broadcast ${input.broadcastId} (directo): ${failed}/${total} entregas fallaron`);
+		else this.logger.logOk(`broadcast ${input.broadcastId} (directo) completado: ${total} usuario(s)`);
+	}
+
+	/**
+	 * Procesa UN chunk: entrega una página y re-publica (re-firmado) con el cursor
+	 * avanzado si quedan más. Si alguna entrega falla, lanza: la cola reintenta y el
+	 * dedup saltea a los ya alcanzados. Un job sin firma válida se descarta (un
+	 * reintento nunca lo volvería válido).
+	 */
+	async #processBroadcastChunk(job: BroadcastJob): Promise<void> {
+		if (!this.#verifyBroadcastJob(job)) {
+			this.logger.logWarn(
+				`broadcast descartado: job sin firma válida (broadcastId=${job.broadcastId ?? "?"}, origin=${job.origin ?? "?"})`
+			);
+			return;
+		}
+		const ids = await this.#fetchUserIdsPage(job.cursor ?? null, BROADCAST_CHUNK);
+		const delivered = (job.delivered ?? 0) + ids.length;
+		if (ids.length > 0) {
+			const failed = await this.#deliverBroadcastPage(job, ids);
+			if (failed > 0) throw new Error(`broadcast ${job.broadcastId}: ${failed}/${ids.length} entregas fallaron en el chunk`);
+		}
+		if (ids.length === BROADCAST_CHUNK) {
+			await this.#publishBroadcastJob({ ...job, cursor: ids.at(-1), delivered });
+		} else {
+			this.logger.logOk(`broadcast ${job.broadcastId} completado: ${delivered} usuario(s)`);
+		}
+	}
+
+	/** Entrega una página del broadcast; devuelve cuántas entregas fallaron. */
+	async #deliverBroadcastPage(input: BroadcastInput, userIds: string[]): Promise<number> {
+		const results = await Promise.allSettled(
+			userIds.map((userId) =>
+				this.#deliver(
+					{
+						userId,
+						topic: input.topic,
+						title: input.title,
+						body: input.body,
+						origin: input.origin,
+						icon: input.icon,
+						link: input.link,
+						linkApp: input.linkApp,
+						data: input.data,
+					},
+					input.broadcastId
+				)
+			)
+		);
+		return results.filter((r) => r.status === "rejected").length;
+	}
+
+	/** Página de IDs de usuarios activos (`id > afterId`, ascendente) vía identity interna. */
+	async #fetchUserIdsPage(afterId: string | null, limit: number): Promise<string[]> {
+		const internal = this.#identityInternal();
+		if (!internal) {
+			throw new NotificationError(503, "TRANSPORT_UNAVAILABLE", "IdentityManagerService no disponible para enumerar destinatarios");
+		}
+		return internal.users.getUserIdsPage(afterId, limit);
 	}
 
 	/**
@@ -165,14 +323,22 @@ export default class NotificationService extends BaseService implements INotific
 	}
 
 	/** Persiste (inApp), empuja por SSE y dispara email/push según preferencias. */
-	async #deliver(rawInput: NotifyInput): Promise<void> {
+	async #deliver(rawInput: NotifyInput, broadcastId?: string): Promise<void> {
 		const input = this.#applyPolicy(rawInput);
 		if (!input) return;
 
 		const channels = await this.preferences.resolveChannels(input.userId, input.topic, input.channels);
 		if (channels.length === 0) return;
 
-		if (channels.includes("inApp")) {
+		if (broadcastId) {
+			// El doc es el registro de dedup: si ya existe, el usuario ya recibió todos los canales.
+			const notification = await this.notifications.createBroadcast(input, channels, broadcastId);
+			if (!notification) return;
+			if (channels.includes("inApp")) {
+				const unread = await this.notifications.unreadCount(input.userId);
+				this.#hub?.publishToUser(input.userId, { type: "notification", unread, notification });
+			}
+		} else if (channels.includes("inApp")) {
 			// Digest: si ya hay una no leída del mismo topic, no apilamos otra.
 			const collapse = input.collapseUnread && (await this.notifications.hasUnreadForTopic(input.userId, input.topic));
 			if (!collapse) {
@@ -228,6 +394,19 @@ export default class NotificationService extends BaseService implements INotific
 	}
 
 	// ─── Internos ───────────────────────────────────────────────────────────
+	/**
+	 * Superficie interna de identity (scope `identity:internal`), resuelta por llamada:
+	 * si IdentityManagerService se reinicia, no queda una instancia cacheada muerta.
+	 */
+	#identityInternal(): ReturnType<IIdentityManagerService["_internal"]> | null {
+		try {
+			const identity = this.getMyService<IIdentityManagerService>("IdentityManagerService");
+			return identity._internal(this.getCapability());
+		} catch {
+			return null;
+		}
+	}
+
 	/** Verificador de sesión lazy (la campana manda la cookie de sesión al SSE). */
 	#getSessionVerifier(): ISessionVerifier | null {
 		// SessionManagerService es dependencia declarada pero opcional en runtime (SSE → 503 si falta).
@@ -257,7 +436,8 @@ export default class NotificationService extends BaseService implements INotific
 
 	async #resolveUserEmail(userId: string): Promise<string | null> {
 		try {
-			const user = await this.#identity?.users.getUser(userId);
+			// Superficie interna (sin token): la pública exige un token de sesión que acá no hay.
+			const user = await this.#identityInternal()?.users.getUser(userId);
 			return user?.email ?? null;
 		} catch {
 			return null;
@@ -280,7 +460,17 @@ export default class NotificationService extends BaseService implements INotific
 			this.#rabbit.createOperationConsumer(NOTIFY_SERVICE, NOTIFY_OPERATION, async (msg) => {
 				await this.#deliver(msg.body as unknown as NotifyInput);
 			});
-			this.logger.logOk("NotificationService: consumidor de cola activo (entrega durable)");
+			// Broadcasts: timeout holgado (un chunk entrega BROADCAST_CHUNK usuarios: mongo + SSE + email).
+			await this.#rabbit.declareOperationTopology(NOTIFY_SERVICE, NOTIFY_BROADCAST_OPERATION);
+			this.#rabbit.createOperationConsumer(
+				NOTIFY_SERVICE,
+				NOTIFY_BROADCAST_OPERATION,
+				async (msg) => {
+					await this.#processBroadcastChunk(msg.body as unknown as BroadcastJob);
+				},
+				{ jobTimeoutMs: 60_000 }
+			);
+			this.logger.logOk("NotificationService: consumidores de cola activos (notify + broadcast durables)");
 		} catch (e) {
 			this.#rabbit = null;
 			this.logger.logWarn(`Cola de notificaciones no disponible; solo entrega directa: ${(e as Error).message}`);

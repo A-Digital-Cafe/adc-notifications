@@ -29,10 +29,39 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/settings/privacy-security",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	"security.new_login": {
+		title: "Nuevo inicio de sesión",
+		body: "Se detectó un inicio de sesión desde una IP nueva. Si no fuiste vos, cambiá tu contraseña.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["SessionManagerService"],
+	},
+	"security.sessions_revoked": {
+		title: "Tus sesiones fueron cerradas",
+		body: "Un administrador cerró tus sesiones activas. Vas a tener que iniciar sesión de nuevo.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["SessionManagerService"],
+	},
+	// Alerta interna para el equipo (Admins + Security Managers globales): ban
+	// aplicado/levantado, rol modificado/eliminado, usuario eliminado. El detalle
+	// viaja en `data`; el texto visible es canónico (anti-phishing).
+	"security.alert": {
+		title: "Alerta de seguridad",
+		body: "Se registró una acción administrativa sensible (moderación, roles o usuarios). Revisá el panel de identidad.",
+		linkApp: "identity",
+		link: "/users",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 };
 
 /** Prefijos reservados: todo topic bajo estos namespaces DEBE tener plantilla declarada. */
 export const RESERVED_TOPIC_PREFIXES = ["security."] as const;
+
+// Broadcasts: sin allowlist de `origin` (forjable); la puerta es la capability con
+// scope `notifications:broadcast` + firma HMAC de los jobs (ver index.ts).
 
 export function isReservedTopic(topic: string): boolean {
 	return RESERVED_TOPIC_PREFIXES.some((p) => topic.startsWith(p));

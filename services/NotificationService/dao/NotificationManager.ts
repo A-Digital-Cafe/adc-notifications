@@ -19,14 +19,12 @@ export class NotificationManager {
 		this.#model = model;
 	}
 
-	/** Persiste una notificación (canal inApp). Devuelve el documento creado. */
-	async create(input: NotifyInput, channels: NotificationChannel[]): Promise<Notification> {
+	#buildDoc(input: NotifyInput, channels: NotificationChannel[], broadcastId: string | null): Notification {
 		if (!input.userId) throw new NotificationError(400, "MISSING_FIELDS", "userId requerido");
 		if (!input.topic) throw new NotificationError(400, "MISSING_FIELDS", "topic requerido");
 		if (!input.title) throw new NotificationError(400, "MISSING_FIELDS", "title requerido");
 
-		const now = new Date();
-		const doc: Notification = {
+		return {
 			id: randomUUID(),
 			userId: input.userId,
 			orgId: input.orgId ?? null,
@@ -38,11 +36,32 @@ export class NotificationManager {
 			linkApp: input.linkApp ?? null,
 			data: input.data ?? null,
 			channels,
+			broadcastId,
 			readAt: null,
-			createdAt: now,
+			createdAt: new Date(),
 		};
+	}
+
+	/** Persiste una notificación (canal inApp). Devuelve el documento creado. */
+	async create(input: NotifyInput, channels: NotificationChannel[]): Promise<Notification> {
+		const doc = this.#buildDoc(input, channels, null);
 		await this.#model.create(doc);
 		return doc;
+	}
+
+	/**
+	 * Persiste la notificación de un broadcast con dedup por `(userId, broadcastId)`:
+	 * si ya existe (reentrega/reintento) devuelve `null` sin duplicar ni fallar.
+	 */
+	async createBroadcast(input: NotifyInput, channels: NotificationChannel[], broadcastId: string): Promise<Notification | null> {
+		const doc = this.#buildDoc(input, channels, broadcastId);
+		try {
+			await this.#model.create(doc);
+			return doc;
+		} catch (e: unknown) {
+			if ((e as { code?: number })?.code === 11000) return null;
+			throw e;
+		}
 	}
 
 	/** Bandeja paginada por cursor (`before`), más recientes primero. */

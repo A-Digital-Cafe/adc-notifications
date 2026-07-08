@@ -73,8 +73,11 @@ export default function App() {
 	const onItemClick = useCallback(async (n: NotificationItem) => {
 		if (!n.readAt) {
 			const res = await api.post<{ unread: number }>(`/${n.id}/read`, { silent: true });
-			if (res.success && res.data) setUnread(res.data.unread);
-			setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: new Date().toISOString() } : x)));
+			// Reflejar la lectura sólo si el server la persistió (si no, reaparece al recargar).
+			if (res.success && res.data) {
+				setUnread(res.data.unread);
+				setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: new Date().toISOString() } : x)));
+			}
 		}
 		const url = href(n);
 		if (url) globalThis.location.href = url;

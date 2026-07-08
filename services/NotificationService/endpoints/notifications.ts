@@ -63,6 +63,8 @@ export class NotificationEndpoints {
 		options: {
 			tag: "NotificationService/Inbox",
 			summary: "Marca una notificación como leída",
+			// Idempotente por naturaleza (fija readAt): sin guard de Idempotency-Key.
+			skipIdempotency: true,
 			schema: { params: NS.NotificationIdParams, response: { 200: NS.ReadResponse } },
 		},
 	})
@@ -80,6 +82,8 @@ export class NotificationEndpoints {
 		options: {
 			tag: "NotificationService/Inbox",
 			summary: "Marca todas las notificaciones como leídas",
+			// Idempotente por naturaleza (fija readAt en masa): sin guard de Idempotency-Key.
+			skipIdempotency: true,
 			schema: { response: { 200: NS.ReadResponse } },
 		},
 	})

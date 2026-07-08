@@ -1,6 +1,7 @@
 {
 	"name": "NotificationService",
 	"uiName": "Notificaciones",
+	"privileges": ["identity:internal"],
 	"version": "1.0.0",
 	"kernelMode": 80,
 	"failOnError": false,
