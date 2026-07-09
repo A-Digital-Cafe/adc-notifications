@@ -12,7 +12,7 @@ import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts
 import type { INotificationService, INotificationEmailSender } from "@common/types/notifications/INotificationService.ts";
 import type { BroadcastInput, Notification, NotificationPreference, NotifyInput } from "@common/types/notifications/Notification.ts";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
-import { assertScope, Scope, type CapabilityToken } from "@common/security/Capability.ts";
+import { assertScope, Scope, Capability, type CapabilityToken } from "@common/security/Capability.ts";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { notificationSchema, notificationSecretSchema, preferenceSchema, type NotificationSecret } from "./domain/index.ts";
@@ -144,8 +144,8 @@ export default class NotificationService extends BaseService implements INotific
 	 * el consumidor de la cola (vía `#deliver`). Preferí **`emitNotification`** en
 	 * los productores (desacoplado y durable) en vez de llamar esto directo.
 	 */
-	async notify(input: NotifyInput): Promise<void> {
-		return this.#deliver(input);
+	async notify(input: NotifyInput, cap?: CapabilityToken): Promise<void> {
+		return this.#deliver(input, undefined, cap);
 	}
 
 	/**
@@ -286,7 +286,7 @@ export default class NotificationService extends BaseService implements INotific
 	 *
 	 * @returns el input efectivo a entregar, o `null` si debe descartarse.
 	 */
-	#applyPolicy(input: NotifyInput): NotifyInput | null {
+	#applyPolicy(input: NotifyInput, cap?: CapabilityToken): NotifyInput | null {
 		const { topic } = input;
 		let effective = input;
 
@@ -296,8 +296,13 @@ export default class NotificationService extends BaseService implements INotific
 				this.logger.logWarn(`notify: topic reservado desconocido '${topic}' descartado (origen=${input.origin ?? "?"})`);
 				return null;
 			}
-			if (!tpl.allowedOrigins.includes(input.origin ?? "")) {
-				this.logger.logWarn(`notify: origen '${input.origin ?? "?"}' no autorizado para '${topic}'; descartado (posible spoofing)`);
+			// El `origin` se deriva de la **capability** (infalsificable), no del payload:
+			// exige capability con `identity:internal` y que su owner esté allowlisted para el
+			// topic. Así un módulo comprometido no puede spoofear avisos de seguridad ni
+			// inyectarlos por la cola (el consumidor entrega sin capability → se descartan).
+			const owner = Capability.is(cap) && cap.has(Scope.IdentityInternal) ? cap.owner : null;
+			if (!owner || !tpl.allowedOrigins.includes(owner)) {
+				this.logger.logWarn(`notify: emisor '${owner ?? input.origin ?? "?"}' no autorizado para '${topic}'; descartado (posible spoofing)`);
 				return null;
 			}
 			// Contenido canónico del servidor: ignoramos title/body/link/channels del productor.
@@ -311,6 +316,7 @@ export default class NotificationService extends BaseService implements INotific
 				link: tpl.link,
 				data: input.data,
 				collapseUnread: input.collapseUnread,
+				origin: owner, // origin infalsificable (de la capability), no el del payload
 			};
 		}
 
@@ -323,8 +329,8 @@ export default class NotificationService extends BaseService implements INotific
 	}
 
 	/** Persiste (inApp), empuja por SSE y dispara email/push según preferencias. */
-	async #deliver(rawInput: NotifyInput, broadcastId?: string): Promise<void> {
-		const input = this.#applyPolicy(rawInput);
+	async #deliver(rawInput: NotifyInput, broadcastId?: string, cap?: CapabilityToken): Promise<void> {
+		const input = this.#applyPolicy(rawInput, cap);
 		if (!input) return;
 
 		const channels = await this.preferences.resolveChannels(input.userId, input.topic, input.channels);
