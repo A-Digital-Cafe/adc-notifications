@@ -92,6 +92,13 @@ export class NotificationManager {
 		return this.unreadCount(userId);
 	}
 
+	/** Elimina una notificación del usuario. Devuelve el nuevo conteo de no leídas. */
+	async delete(userId: string, id: string): Promise<number> {
+		const res = await this.#model.deleteOne({ id, userId });
+		if (res.deletedCount === 0) throw new NotificationError(404, "NOTIFICATION_NOT_FOUND", "Notificación no encontrada");
+		return this.unreadCount(userId);
+	}
+
 	/** Marca todas las del usuario como leídas. */
 	async markAllRead(userId: string): Promise<void> {
 		await this.#model.updateMany({ userId, readAt: null }, { $set: { readAt: new Date() } });

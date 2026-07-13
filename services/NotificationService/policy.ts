@@ -55,6 +55,26 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/users",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	// Alerta interna para el equipo (mismos destinatarios): un módulo agotó sus
+	// reintentos rápidos y quedó en reintento lento (circuit breaker del kernel
+	// abierto). El módulo y el último error viajan en `data`.
+	"security.module_failure": {
+		title: "Fallo de módulo en la plataforma",
+		body: "Un módulo está fallando repetidamente y pasó a reintentos lentos. Revisá el gestor de módulos.",
+		linkApp: "modules",
+		link: "/",
+		allowedOrigins: ["IdentityManagerService"],
+	},
+	// Alerta interna para el equipo (mismos destinatarios): apareció un módulo NUEVO
+	// en runtime. NO se ejecutó (queda pendiente de lanzamiento manual); el aviso pide
+	// revisarlo en el gestor de módulos. El detalle (módulo, capa, path) viaja en `data`.
+	"security.module_detected": {
+		title: "Módulo nuevo detectado en la plataforma",
+		body: "Se detectó un módulo nuevo en runtime. No se ejecutó: está pendiente de lanzamiento en el gestor de módulos.",
+		linkApp: "modules",
+		link: "/",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 };
 
 /** Prefijos reservados: todo topic bajo estos namespaces DEBE tener plantilla declarada. */

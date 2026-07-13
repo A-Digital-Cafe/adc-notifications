@@ -1,29 +1,15 @@
 import { useEffect, useState, useCallback } from "react";
 import "@ui-library/utils/react-jsx";
 import { getSession } from "@ui-library/utils/session";
-import { createAdcApi } from "@ui-library/utils/adc-fetch";
-import { resolvePlatformPath } from "@ui-library/utils/platform-links";
+import {
+	inboxApi as api,
+	notificationHref as href,
+	markRead,
+	deleteNotification,
+	type NotificationItem,
+} from "./lib/inbox";
 
-interface NotificationItem {
-	id: string;
-	topic: string;
-	title: string;
-	body: string;
-	icon?: string | null;
-	link?: string | null;
-	linkApp?: string | null;
-	readAt?: string | null;
-	createdAt: string;
-}
-
-const api = createAdcApi({ basePath: "/api/notifications", devPort: 3000 });
 const PAGE = 50;
-
-function href(n: NotificationItem): string | null {
-	if (!n.link) return null;
-	if (n.linkApp) return resolvePlatformPath(n.linkApp, n.link) ?? n.link;
-	return n.link;
-}
 
 function formatDate(iso: string): string {
 	try {
@@ -72,15 +58,23 @@ export default function App() {
 
 	const onItemClick = useCallback(async (n: NotificationItem) => {
 		if (!n.readAt) {
-			const res = await api.post<{ unread: number }>(`/${n.id}/read`, { silent: true });
 			// Reflejar la lectura sólo si el server la persistió (si no, reaparece al recargar).
-			if (res.success && res.data) {
-				setUnread(res.data.unread);
+			const unread = await markRead(n.id);
+			if (unread !== null) {
+				setUnread(unread);
 				setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: new Date().toISOString() } : x)));
 			}
 		}
 		const url = href(n);
 		if (url) globalThis.location.href = url;
+	}, []);
+
+	const onDelete = useCallback(async (n: NotificationItem) => {
+		const unread = await deleteNotification(n.id);
+		if (unread !== null) {
+			setUnread(unread);
+			setItems((prev) => prev.filter((x) => x.id !== n.id));
+		}
 	}, []);
 
 	const markAllRead = useCallback(async () => {
@@ -120,10 +114,10 @@ export default function App() {
 				) : (
 					<ul className="rounded-xl overflow-hidden ring-1 ring-black/5 bg-surface text-tsurface divide-y divide-black/5">
 						{items.map((n) => (
-							<li key={n.id}>
+							<li key={n.id} className="flex items-center gap-2 pr-3 hover:bg-black/5 transition-colors">
 								<button
 									type="button"
-									className={`w-full text-left px-4 py-3.5 hover:bg-black/5 transition-colors ${n.readAt ? "opacity-60" : ""}`}
+									className={`flex-1 min-w-0 text-left px-4 py-3.5 ${n.readAt ? "opacity-60" : ""}`}
 									onClick={() => onItemClick(n)}
 								>
 									<div className="flex items-start gap-3">
@@ -135,6 +129,9 @@ export default function App() {
 										</span>
 									</div>
 								</button>
+								<adc-button-rounded variant="danger" size="md" aria-label="Eliminar notificación" onClick={() => onDelete(n)}>
+									<adc-icon-close size="0.875rem" />
+								</adc-button-rounded>
 							</li>
 						))}
 					</ul>

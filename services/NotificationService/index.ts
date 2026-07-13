@@ -371,6 +371,14 @@ export default class NotificationService extends BaseService implements INotific
 		return unread;
 	}
 
+	/** Elimina una notificación de la bandeja y sincroniza el conteo por SSE. */
+	async deleteNotification(userId: string, id: string): Promise<number> {
+		const unread = await this.notifications.delete(userId, id);
+		// Reusa el evento "read": para las otras pestañas sólo importa el badge.
+		this.#hub?.publishToUser(userId, { type: "read", unread });
+		return unread;
+	}
+
 	/** Marca todas como leídas y sincroniza por SSE. */
 	async markAllRead(userId: string): Promise<void> {
 		await this.notifications.markAllRead(userId);

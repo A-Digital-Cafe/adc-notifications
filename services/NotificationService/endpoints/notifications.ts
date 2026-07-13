@@ -76,6 +76,25 @@ export class NotificationEndpoints {
 	}
 
 	@RegisterEndpoint({
+		method: "DELETE",
+		url: "/api/notifications/:id",
+		requireAuth: true,
+		options: {
+			tag: "NotificationService/Inbox",
+			summary: "Elimina una notificación de la bandeja del usuario",
+			// Idempotente por naturaleza (borrar dos veces = 404 inocuo): sin guard de Idempotency-Key.
+			skipIdempotency: true,
+			schema: { params: NS.NotificationIdParams, response: { 200: NS.ReadResponse } },
+		},
+	})
+	static async remove(ctx: EndpointCtx<{ id: string }>) {
+		const svc = NotificationEndpoints.service;
+		const userId = requireUserId(ctx);
+		const unread = await svc.deleteNotification(userId, ctx.params.id);
+		return { ok: true, unread };
+	}
+
+	@RegisterEndpoint({
 		method: "POST",
 		url: "/api/notifications/read-all",
 		requireAuth: true,

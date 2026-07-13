@@ -22,7 +22,10 @@
 				"domains": ["adigitalcafe.com"],
 				"subdomains": ["notifications"]
 			}
-		]
+		],
+		"federationExposes": {
+			"./NotificationsMenu": "./src/federated/notifications-menu.tsx"
+		}
 	},
 	"services": []
 }
