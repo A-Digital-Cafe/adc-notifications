@@ -27,5 +27,10 @@
 			"./NotificationsMenu": "./src/federated/notifications-menu.tsx"
 		}
 	},
-	"services": []
+	"services": [
+		{
+			"name": "NotificationService",
+			"version": "latest"
+		}
+	]
 }
