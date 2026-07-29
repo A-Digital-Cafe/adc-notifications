@@ -82,26 +82,27 @@ export class NotificationManager {
 		return (await this.#model.exists({ userId, topic, readAt: null })) !== null;
 	}
 
-	/** Marca una notificación del usuario como leída. Devuelve el nuevo conteo de no leídas. */
-	async markRead(userId: string, id: string): Promise<number> {
+	/** Marca una notificación como leída. Devuelve el conteo de no leídas, o `null` si ya no estaba. */
+	async markRead(userId: string, id: string): Promise<number | null> {
 		const res = await this.#model.updateOne({ id, userId, readAt: null }, { $set: { readAt: new Date() } });
 		if (res.matchedCount === 0) {
 			const exists = await this.#model.exists({ id, userId });
-			if (!exists) throw new NotificationError(404, "NOTIFICATION_NOT_FOUND", "Notificación no encontrada");
+			if (!exists) return null;
 		}
 		return this.unreadCount(userId);
 	}
 
-	/** Elimina una notificación del usuario. Devuelve el nuevo conteo de no leídas. */
-	async delete(userId: string, id: string): Promise<number> {
+	/** Elimina una notificación. Devuelve el conteo de no leídas, o `null` si ya no estaba. */
+	async delete(userId: string, id: string): Promise<number | null> {
 		const res = await this.#model.deleteOne({ id, userId });
-		if (res.deletedCount === 0) throw new NotificationError(404, "NOTIFICATION_NOT_FOUND", "Notificación no encontrada");
+		if (res.deletedCount === 0) return null;
 		return this.unreadCount(userId);
 	}
 
-	/** Marca todas las del usuario como leídas. */
-	async markAllRead(userId: string): Promise<void> {
-		await this.#model.updateMany({ userId, readAt: null }, { $set: { readAt: new Date() } });
+	/** Marca todas las del usuario como leídas. Devuelve cuántas cambiaron. */
+	async markAllRead(userId: string): Promise<number> {
+		const res = await this.#model.updateMany({ userId, readAt: null }, { $set: { readAt: new Date() } });
+		return res.modifiedCount ?? 0;
 	}
 
 	async purgeByUser(userId: string): Promise<number> {

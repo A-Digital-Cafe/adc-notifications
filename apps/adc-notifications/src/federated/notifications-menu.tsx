@@ -12,7 +12,7 @@ import "@ui-library/utils/react-jsx";
 import { resolvePlatformPath } from "@ui-library/utils/platform-links";
 // El chunk expuesto arrastra los estilos: style-loader los inyecta en el host que lo cargue.
 import "../styles/tailwind.css";
-import { inboxApi as api, notificationHref, markRead, deleteNotification, type NotificationItem } from "../lib/inbox";
+import { inboxApi as api, notificationHref, useInboxMutations, type NotificationItem } from "../lib/inbox";
 
 export interface NotificationsMenuProps {
 	/** Notifica cambios del conteo de no leídas (para el badge de la campana). */
@@ -37,9 +37,9 @@ function NotificationsMenu({ onUnreadChange }: Readonly<NotificationsMenuProps>)
 		(async () => {
 			const res = await api.get<{ notifications: NotificationItem[]; unread: number }>("", { silent: true });
 			if (!alive) return;
-			if (res.success && res.data) {
-				setItems(res.data.notifications);
-				syncUnread(res.data.unread);
+			if (res.success) {
+				setItems(res.data?.notifications ?? []);
+				syncUnread(res.data?.unread ?? 0);
 			}
 			setLoading(false);
 		})();
@@ -48,47 +48,23 @@ function NotificationsMenu({ onUnreadChange }: Readonly<NotificationsMenuProps>)
 		};
 	}, [syncUnread]);
 
+	const { readItem, removeItem, readAll } = useInboxMutations(setItems, syncUnread);
+
 	const onItemClick = useCallback(
 		async (n: NotificationItem) => {
-			if (!n.readAt) {
-				// Reflejar la lectura sólo si el server la persistió (si no, reaparece al recargar).
-				const next = await markRead(n.id);
-				if (next !== null) {
-					syncUnread(next);
-					setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: new Date().toISOString() } : x)));
-				}
-			}
+			await readItem(n);
 			const href = notificationHref(n);
 			if (href) globalThis.location.href = href;
 		},
-		[syncUnread]
+		[readItem]
 	);
-
-	const onDelete = useCallback(
-		async (n: NotificationItem) => {
-			const next = await deleteNotification(n.id);
-			if (next !== null) {
-				syncUnread(next);
-				setItems((prev) => prev.filter((x) => x.id !== n.id));
-			}
-		},
-		[syncUnread]
-	);
-
-	const markAllRead = useCallback(async () => {
-		const res = await api.post<{ unread: number }>("/read-all", { silent: true });
-		if (res.success) {
-			syncUnread(0);
-			setItems((prev) => prev.map((x) => (x.readAt ? x : { ...x, readAt: new Date().toISOString() })));
-		}
-	}, [syncUnread]);
 
 	return (
 		<div className="w-80 max-w-[calc(100vw-1.5rem)] max-h-112 overflow-hidden rounded-xl bg-surface text-tsurface shadow-cozy ring-1 ring-black/5 flex flex-col">
 			<div className="flex items-center justify-between px-4 py-2.5 border-b border-black/10">
 				<span className="font-bold text-sm">Notificaciones</span>
 				{unread > 0 && (
-					<button type="button" className="text-xs text-accent hover:underline" onClick={markAllRead}>
+					<button type="button" className="text-xs text-accent hover:underline" onClick={readAll}>
 						Marcar todas como leídas
 					</button>
 				)}
@@ -112,7 +88,7 @@ function NotificationsMenu({ onUnreadChange }: Readonly<NotificationsMenuProps>)
 									</span>
 								</div>
 							</button>
-							<adc-button-rounded variant="danger" size="md" aria-label="Eliminar notificación" onClick={() => onDelete(n)}>
+							<adc-button-rounded variant="danger" size="md" aria-label="Eliminar notificación" onClick={() => removeItem(n)}>
 								<adc-icon-close size="0.75rem" />
 							</adc-button-rounded>
 						</div>

@@ -1,3 +1,4 @@
+import { Type } from "@sinclair/typebox";
 import { RegisterEndpoint, type EndpointCtx } from "@services/core/EndpointManagerService/index.js";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
 import type NotificationService from "../index.ts";
@@ -25,7 +26,10 @@ export class NotificationEndpoints {
 		options: {
 			tag: "NotificationService/Inbox",
 			summary: "Lista la bandeja del usuario (paginada por cursor)",
-			schema: { querystring: NS.ListQuery, response: { 200: NS.ListResponse } },
+			schema: {
+				querystring: NS.ListQuery,
+				response: { 200: NS.ListResponse, 204: Type.Null({ description: "Bandeja vacía o fin del cursor" }) },
+			},
 		},
 	})
 	static async list(ctx: EndpointCtx) {
@@ -37,6 +41,9 @@ export class NotificationEndpoints {
 			svc.notifications.list(userId, { limit, before: before && !Number.isNaN(before.getTime()) ? before : undefined }),
 			svc.notifications.unreadCount(userId),
 		]);
+		// Con cursor `before`, una página vacía sólo significa "no hay más": el front
+		// conserva el conteo que ya tenía en vez de asumir bandeja vacía.
+		if (notifications.length === 0) return undefined;
 		return { notifications, unread };
 	}
 
@@ -47,13 +54,15 @@ export class NotificationEndpoints {
 		options: {
 			tag: "NotificationService/Inbox",
 			summary: "Conteo de notificaciones no leídas",
-			schema: { response: { 200: NS.UnreadCountResponse } },
+			etag: true,
+			schema: { response: { 200: NS.UnreadCountResponse, 204: Type.Null({ description: "Nada sin leer" }) } },
 		},
 	})
 	static async unreadCount(ctx: EndpointCtx) {
 		const svc = NotificationEndpoints.service;
 		const userId = requireUserId(ctx);
-		return { unread: await svc.notifications.unreadCount(userId) };
+		const unread = await svc.notifications.unreadCount(userId);
+		return unread === 0 ? undefined : { unread };
 	}
 
 	@RegisterEndpoint({
@@ -65,14 +74,17 @@ export class NotificationEndpoints {
 			summary: "Marca una notificación como leída",
 			// Idempotente por naturaleza (fija readAt): sin guard de Idempotency-Key.
 			skipIdempotency: true,
-			schema: { params: NS.NotificationIdParams, response: { 200: NS.ReadResponse } },
+			schema: {
+				params: NS.NotificationIdParams,
+				response: { 200: NS.ReadResponse, 204: Type.Null({ description: "Ya no estaba en la bandeja (no-op)" }) },
+			},
 		},
 	})
 	static async markRead(ctx: EndpointCtx<{ id: string }>) {
 		const svc = NotificationEndpoints.service;
 		const userId = requireUserId(ctx);
 		const unread = await svc.markRead(userId, ctx.params.id);
-		return { ok: true, unread };
+		return unread === null ? undefined : { ok: true, unread };
 	}
 
 	@RegisterEndpoint({
@@ -82,16 +94,19 @@ export class NotificationEndpoints {
 		options: {
 			tag: "NotificationService/Inbox",
 			summary: "Elimina una notificación de la bandeja del usuario",
-			// Idempotente por naturaleza (borrar dos veces = 404 inocuo): sin guard de Idempotency-Key.
+			// Idempotente por naturaleza (borrar dos veces = 204 inocuo): sin guard de Idempotency-Key.
 			skipIdempotency: true,
-			schema: { params: NS.NotificationIdParams, response: { 200: NS.ReadResponse } },
+			schema: {
+				params: NS.NotificationIdParams,
+				response: { 200: NS.ReadResponse, 204: Type.Null({ description: "Ya no estaba en la bandeja (no-op)" }) },
+			},
 		},
 	})
 	static async remove(ctx: EndpointCtx<{ id: string }>) {
 		const svc = NotificationEndpoints.service;
 		const userId = requireUserId(ctx);
 		const unread = await svc.deleteNotification(userId, ctx.params.id);
-		return { ok: true, unread };
+		return unread === null ? undefined : { ok: true, unread };
 	}
 
 	@RegisterEndpoint({
@@ -103,13 +118,13 @@ export class NotificationEndpoints {
 			summary: "Marca todas las notificaciones como leídas",
 			// Idempotente por naturaleza (fija readAt en masa): sin guard de Idempotency-Key.
 			skipIdempotency: true,
-			schema: { response: { 200: NS.ReadResponse } },
+			schema: { response: { 200: NS.ReadResponse, 204: Type.Null({ description: "Nada sin leer" }) } },
 		},
 	})
 	static async markAllRead(ctx: EndpointCtx) {
 		const svc = NotificationEndpoints.service;
 		const userId = requireUserId(ctx);
-		await svc.markAllRead(userId);
-		return { ok: true, unread: 0 };
+		const changed = await svc.markAllRead(userId);
+		return changed === 0 ? undefined : { ok: true, unread: 0 };
 	}
 }

@@ -364,25 +364,26 @@ export default class NotificationService extends BaseService implements INotific
 		// por Web Push en una fase futura. Hoy es no-op.
 	}
 
-	/** Marca una notificación como leída y sincroniza el conteo por SSE. */
-	async markRead(userId: string, id: string): Promise<number> {
+	/** Marca una notificación como leída y sincroniza por SSE; `null` = ya no estaba. */
+	async markRead(userId: string, id: string): Promise<number | null> {
 		const unread = await this.notifications.markRead(userId, id);
-		this.#hub?.publishToUser(userId, { type: "read", unread });
+		if (unread !== null) this.#hub?.publishToUser(userId, { type: "read", unread });
 		return unread;
 	}
 
-	/** Elimina una notificación de la bandeja y sincroniza el conteo por SSE. */
-	async deleteNotification(userId: string, id: string): Promise<number> {
+	/** Elimina una notificación de la bandeja y sincroniza por SSE; `null` = ya no estaba. */
+	async deleteNotification(userId: string, id: string): Promise<number | null> {
 		const unread = await this.notifications.delete(userId, id);
 		// Reusa el evento "read": para las otras pestañas sólo importa el badge.
-		this.#hub?.publishToUser(userId, { type: "read", unread });
+		if (unread !== null) this.#hub?.publishToUser(userId, { type: "read", unread });
 		return unread;
 	}
 
-	/** Marca todas como leídas y sincroniza por SSE. */
-	async markAllRead(userId: string): Promise<void> {
-		await this.notifications.markAllRead(userId);
-		this.#hub?.publishToUser(userId, { type: "read", unread: 0 });
+	/** Marca todas como leídas y sincroniza por SSE. Devuelve cuántas cambiaron. */
+	async markAllRead(userId: string): Promise<number> {
+		const changed = await this.notifications.markAllRead(userId);
+		if (changed > 0) this.#hub?.publishToUser(userId, { type: "read", unread: 0 });
+		return changed;
 	}
 
 	// ─── Accesores para endpoints ───────────────────────────────────────────
@@ -445,7 +446,9 @@ export default class NotificationService extends BaseService implements INotific
 		if (!email) return;
 		const subject = input.email?.subject ?? input.title;
 		const html = input.email?.html ?? this.#defaultEmailHtml(input);
-		await sender.sendSystemEmail({ to: email, subject, html, text: input.body });
+		// `userId` deja que el EmailService entregue en el buzón de la plataforma
+		// cuando el envío a direcciones externas está deshabilitado.
+		await sender.sendSystemEmail({ to: email, userId: input.userId, subject, html, text: input.body });
 	}
 
 	async #resolveUserEmail(userId: string): Promise<string | null> {

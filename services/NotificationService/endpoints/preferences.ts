@@ -1,3 +1,4 @@
+import { Type } from "@sinclair/typebox";
 import { RegisterEndpoint, type EndpointCtx } from "@services/core/EndpointManagerService/index.js";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
 import type { NotificationChannel, NotificationTopic } from "@common/types/notifications/Notification.ts";
@@ -26,13 +27,16 @@ export class PreferenceEndpoints {
 		options: {
 			tag: "NotificationService/Preferences",
 			summary: "Lista las preferencias de canal del usuario",
-			schema: { response: { 200: PS.PreferencesListResponse } },
+			schema: {
+				response: { 200: PS.PreferencesListResponse, 204: Type.Null({ description: "Sin preferencias fijadas: rigen los defaults" }) },
+			},
 		},
 	})
 	static async list(ctx: EndpointCtx) {
 		const svc = PreferenceEndpoints.service;
 		const userId = requireUserId(ctx);
-		return { preferences: await svc.preferences.list(userId) };
+		const preferences = await svc.preferences.list(userId);
+		return preferences.length === 0 ? undefined : { preferences };
 	}
 
 	@RegisterEndpoint({

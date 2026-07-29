@@ -1,13 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import "@ui-library/utils/react-jsx";
 import { getSession } from "@ui-library/utils/session";
-import {
-	inboxApi as api,
-	notificationHref as href,
-	markRead,
-	deleteNotification,
-	type NotificationItem,
-} from "./lib/inbox";
+import { inboxApi as api, notificationHref as href, useInboxMutations, type NotificationItem } from "./lib/inbox";
 
 const PAGE = 50;
 
@@ -33,7 +27,16 @@ export default function App() {
 			silent: true,
 		});
 		setLoadingMore(false);
-		if (!res.success || !res.data) return;
+		if (!res.success) return;
+		// 204: bandeja vacía (primera página) o fin del cursor (paginando).
+		if (!res.data) {
+			if (!before) {
+				setItems([]);
+				setUnread(0);
+			}
+			setDone(true);
+			return;
+		}
 		setUnread(res.data.unread);
 		setItems((prev) => (before ? [...prev, ...res.data!.notifications] : res.data!.notifications));
 		if (res.data.notifications.length < PAGE) setDone(true);
@@ -56,34 +59,16 @@ export default function App() {
 		};
 	}, [load]);
 
-	const onItemClick = useCallback(async (n: NotificationItem) => {
-		if (!n.readAt) {
-			// Reflejar la lectura sólo si el server la persistió (si no, reaparece al recargar).
-			const unread = await markRead(n.id);
-			if (unread !== null) {
-				setUnread(unread);
-				setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: new Date().toISOString() } : x)));
-			}
-		}
-		const url = href(n);
-		if (url) globalThis.location.href = url;
-	}, []);
+	const { readItem, removeItem, readAll } = useInboxMutations(setItems, setUnread);
 
-	const onDelete = useCallback(async (n: NotificationItem) => {
-		const unread = await deleteNotification(n.id);
-		if (unread !== null) {
-			setUnread(unread);
-			setItems((prev) => prev.filter((x) => x.id !== n.id));
-		}
-	}, []);
-
-	const markAllRead = useCallback(async () => {
-		const res = await api.post("/read-all", { silent: true });
-		if (res.success) {
-			setUnread(0);
-			setItems((prev) => prev.map((x) => (x.readAt ? x : { ...x, readAt: new Date().toISOString() })));
-		}
-	}, []);
+	const onItemClick = useCallback(
+		async (n: NotificationItem) => {
+			await readItem(n);
+			const url = href(n);
+			if (url) globalThis.location.href = url;
+		},
+		[readItem]
+	);
 
 	let body: React.ReactNode;
 	if (status === "loading") {
@@ -103,7 +88,7 @@ export default function App() {
 						Notificaciones {unread > 0 && <span className="text-base text-accent">({unread} sin leer)</span>}
 					</h1>
 					{unread > 0 && (
-						<button type="button" className="text-sm text-accent hover:underline" onClick={markAllRead}>
+						<button type="button" className="text-sm text-accent hover:underline" onClick={readAll}>
 							Marcar todas como leídas
 						</button>
 					)}
@@ -129,7 +114,7 @@ export default function App() {
 										</span>
 									</div>
 								</button>
-								<adc-button-rounded variant="danger" size="md" aria-label="Eliminar notificación" onClick={() => onDelete(n)}>
+								<adc-button-rounded variant="danger" size="md" aria-label="Eliminar notificación" onClick={() => removeItem(n)}>
 									<adc-icon-close size="0.875rem" />
 								</adc-button-rounded>
 							</li>
@@ -143,7 +128,7 @@ export default function App() {
 							type="button"
 							className="px-4 py-2 text-sm rounded-lg ring-1 ring-black/10 hover:bg-black/5 disabled:opacity-50"
 							disabled={loadingMore}
-							onClick={() => load(items[items.length - 1]?.createdAt)}
+							onClick={() => load(items.at(-1)?.createdAt)}
 						>
 							{loadingMore ? "Cargando…" : "Cargar más"}
 						</button>
