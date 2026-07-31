@@ -12,6 +12,8 @@ export interface SseRouteDeps {
 	/** Conteo inicial de no leídas para el evento `ready`. */
 	getUnreadCount: (userId: string) => Promise<number>;
 	logger: ILogger;
+	/** Nombre del módulo dueño: sin él la ruta sobrevive a la detención del servicio. */
+	owner: string;
 }
 
 const SSE_PATH = "/api/notifications/stream";
@@ -22,7 +24,7 @@ const SSE_PATH = "/api/notifications/stream";
  * y escribe en `reply.raw`, evitando el gotcha de Bun con `reply.send(Readable)`.
  */
 export function registerSseRoute(deps: SseRouteDeps): void {
-	const { httpProvider, hub, getVerifier, getUnreadCount, logger } = deps;
+	const { httpProvider, hub, getVerifier, getUnreadCount, logger, owner } = deps;
 
 	// El stream se sirve sobre el socket crudo (hijack), saltándose el hook de
 	// `@fastify/cors`; replicamos la MISMA política de orígenes del provider para
@@ -101,7 +103,7 @@ export function registerSseRoute(deps: SseRouteDeps): void {
 		};
 		request.raw.on("close", cleanup);
 		request.raw.on("error", cleanup);
-	});
+	}, owner);
 
 	logger.logDebug(`SSE: endpoint registrado en ${SSE_PATH}`);
 }

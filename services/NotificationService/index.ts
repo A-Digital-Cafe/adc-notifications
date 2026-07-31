@@ -111,6 +111,7 @@ export default class NotificationService extends BaseService implements INotific
 			getVerifier: () => this.#getSessionVerifier(),
 			getUnreadCount: (userId: string) => this.notifications.unreadCount(userId),
 			logger: this.logger,
+			owner: this.name,
 		});
 
 		NotificationEndpoints.init(this, kernelKey);
