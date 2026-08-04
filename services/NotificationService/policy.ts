@@ -75,6 +75,17 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	// Alerta interna para el equipo (mismos destinatarios): un módulo pidió privilegios
+	// (`config.json` → `privileges`) que no tenía en su provisión anterior. El caso típico es
+	// un `git pull` que trae un config ampliado. Los scopes agregados y los retenidos por
+	// falta de aprobación viajan en `data`.
+	"security.module_privileges": {
+		title: "Cambio de privilegios de un módulo",
+		body: "Un módulo pidió privilegios que antes no tenía. Revisalo en el gestor de módulos.",
+		linkApp: "modules",
+		link: "/",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 };
 
 /** Prefijos reservados: todo topic bajo estos namespaces DEBE tener plantilla declarada. */
