@@ -81,21 +81,19 @@ export default class NotificationService extends BaseService implements INotific
 		await this.#waitForMongo();
 
 		const priv = (this.config?.private ?? {}) as Record<string, string | undefined>;
-		const dbName = priv.dbName || "adc-notifications";
 		this.#systemFrom = priv.systemFrom || this.#systemFrom;
 		this.#retentionDays = Number(priv.retentionDays || 90) || 90;
 
-		// Vista lógica aislada sobre la conexión Mongo de la plataforma.
-		const db = this.#mongo.useDb(this.#mongo.getConnection(), dbName);
-		const NotificationModel = this.#mongo.createModelForDb<Notification>(db, "notifications", notificationSchema);
-		const PreferenceModel = this.#mongo.createModelForDb<NotificationPreference>(db, "notification_preferences", preferenceSchema);
+		// La base ya es la propia del servicio: la elige el `db` del provider en config.json.
+		const NotificationModel = this.#mongo.createModel<Notification>("notifications", notificationSchema);
+		const PreferenceModel = this.#mongo.createModel<NotificationPreference>("notification_preferences", preferenceSchema);
 
 		this.#notifications = new NotificationManager(NotificationModel);
 		this.#preferences = new PreferenceManager(PreferenceModel);
 		this.#hub = new SseHub(this.logger);
 
 		// Secreto de firma de broadcasts: se crea una sola vez y persiste entre reinicios.
-		const SecretModel = this.#mongo.createModelForDb<NotificationSecret>(db, "notification_secrets", notificationSecretSchema);
+		const SecretModel = this.#mongo.createModel<NotificationSecret>("notification_secrets", notificationSecretSchema);
 		const secret = await SecretModel.findOneAndUpdate(
 			{ _id: "broadcast-hmac" },
 			{ $setOnInsert: { key: randomBytes(32).toString("hex"), createdAt: new Date() } },

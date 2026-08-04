@@ -2,7 +2,9 @@ import type { IHostBasedHttpProvider, FastifyRequest, FastifyReply } from "@inte
 import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
 import type { ILogger } from "@interfaces/utils/ILogger.d.ts";
 import { createCorsOriginGuard } from "@providers/http/fastify-server/security/index.js";
-import type { SseHub, SseConnection } from "./SseHub.ts";
+import { openSseStream, sseEvent, type RawRequestSource } from "@common/utils/sse.ts";
+import type { RawResponseSink } from "@common/utils/http-stream.ts";
+import type { SseHub } from "./SseHub.ts";
 
 export interface SseRouteDeps {
 	httpProvider: IHostBasedHttpProvider;
@@ -42,8 +44,8 @@ export function registerSseRoute(deps: SseRouteDeps): void {
 	};
 
 	httpProvider.registerRoute("GET", SSE_PATH, async (req: FastifyRequest, reply: FastifyReply) => {
-		const rep = reply as unknown as { hijack?: () => void; raw: NodeResponse; code: (n: number) => { send: (b: unknown) => void } };
-		const request = req as unknown as { raw: NodeRequest; cookies?: Record<string, string>; headers?: Record<string, string | undefined> };
+		const rep = reply as unknown as { hijack?: () => void; raw: RawResponseSink; code: (n: number) => { send: (b: unknown) => void } };
+		const request = req as unknown as { raw: RawRequestSource; cookies?: Record<string, string>; headers?: Record<string, string | undefined> };
 
 		// 1. Autenticación: token de sesión desde la cookie del request.
 		const verifier = getVerifier();
@@ -65,55 +67,24 @@ export function registerSseRoute(deps: SseRouteDeps): void {
 			return;
 		}
 		rep.hijack();
-		const raw = rep.raw;
-		raw.writeHead(200, {
-			"Content-Type": "text/event-stream; charset=utf-8",
-			"Cache-Control": "no-cache, no-transform",
-			Connection: "keep-alive",
-			// Desactiva el buffering de proxies (nginx) para el stream.
-			"X-Accel-Buffering": "no",
-			...corsHeadersFor(request.headers?.origin),
-		});
-		raw.write(":\n\n"); // abre el stream
 
-		const conn: SseConnection = {
-			send: (chunk: string) => raw.write(chunk),
-			close: () => {
-				try {
-					raw.end();
-				} catch {
-					/* noop */
-				}
-			},
-		};
-		const dispose = hub.add(userId, conn);
+		// `dispose` se resuelve tarde: `openSseStream` engancha la limpieza antes de que el
+		// hub devuelva su disposer, y un cliente que corta en ese hueco no debe reventar.
+		let dispose: (() => void) | null = null;
+		const conn = openSseStream(rep.raw, request.raw, {
+			headers: corsHeadersFor(request.headers?.origin),
+			onClose: () => dispose?.(),
+		});
+		dispose = hub.add(userId, conn);
 
 		// 3. Evento inicial con el conteo actual de no leídas.
 		try {
 			const unread = await getUnreadCount(userId);
-			raw.write(`data: ${JSON.stringify({ type: "ready", unread })}\n\n`);
+			conn.send(sseEvent({ type: "ready", unread }));
 		} catch (e) {
 			logger.logWarn(`SSE: no se pudo enviar conteo inicial a ${userId}: ${(e as Error).message}`);
 		}
-
-		// 4. Limpieza al cerrarse el cliente.
-		const cleanup = () => {
-			dispose();
-			conn.close();
-		};
-		request.raw.on("close", cleanup);
-		request.raw.on("error", cleanup);
 	}, owner);
 
 	logger.logDebug(`SSE: endpoint registrado en ${SSE_PATH}`);
-}
-
-/** Tipos mínimos del socket crudo de Node (evita depender de los tipos de Fastify). */
-interface NodeResponse {
-	writeHead: (status: number, headers: Record<string, string>) => void;
-	write: (chunk: string) => boolean;
-	end: () => void;
-}
-interface NodeRequest {
-	on: (event: string, listener: () => void) => void;
 }

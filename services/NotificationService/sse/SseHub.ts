@@ -1,17 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { ILogger } from "@interfaces/utils/ILogger.d.ts";
 import type { NotificationStreamEvent } from "@common/types/notifications/Notification.ts";
+import { SseHeartbeat, SSE_PING, sseEvent, type SseConnection } from "@common/utils/sse.ts";
 
-/**
- * Conexión SSE viva de un cliente. La capa de transporte (ruta Fastify) provee
- * `send`/`close` sobre el socket crudo; el hub no conoce Fastify.
- */
-export interface SseConnection {
-	/** Escribe una línea/bloque ya formateado en el stream. */
-	send: (chunk: string) => void;
-	/** Cierra el stream. */
-	close: () => void;
-}
+export type { SseConnection };
 
 interface SseClient {
 	id: string;
@@ -19,10 +11,10 @@ interface SseClient {
 	conn: SseConnection;
 }
 
-const HEARTBEAT_MS = 25_000;
-
 /**
- * Registro en memoria de conexiones SSE por usuario y emisor de eventos.
+ * Registro en memoria de conexiones SSE por usuario y emisor de eventos. El transporte
+ * (hijack, headers, heartbeat) vive en `@common/utils/sse`; acá queda sólo el índice por
+ * usuario, que es lo propio de este servicio.
  *
  * MVP single-instance: cada instancia mantiene sus propias conexiones. Para
  * multi-instancia, un fan-out por cola (RabbitMQ) debería reemitir el evento a la
@@ -31,12 +23,11 @@ const HEARTBEAT_MS = 25_000;
 export class SseHub {
 	readonly #byUser = new Map<string, Set<SseClient>>();
 	readonly #logger: ILogger;
-	#heartbeat: NodeJS.Timeout | null = null;
+	#heartbeat: SseHeartbeat | null;
 
 	constructor(logger: ILogger) {
 		this.#logger = logger;
-		this.#heartbeat = setInterval(() => this.#ping(), HEARTBEAT_MS);
-		this.#heartbeat.unref?.();
+		this.#heartbeat = new SseHeartbeat(() => this.#ping());
 	}
 
 	/** Registra una conexión y devuelve el disposer para quitarla al cerrarse. */
@@ -63,7 +54,7 @@ export class SseHub {
 	publishToUser(userId: string, event: NotificationStreamEvent): void {
 		const set = this.#byUser.get(userId);
 		if (!set || set.size === 0) return;
-		const chunk = `data: ${JSON.stringify(event)}\n\n`;
+		const chunk = sseEvent(event);
 		for (const client of set) {
 			try {
 				client.conn.send(chunk);
@@ -78,7 +69,7 @@ export class SseHub {
 		for (const set of this.#byUser.values()) {
 			for (const client of set) {
 				try {
-					client.conn.send(": ping\n\n");
+					client.conn.send(SSE_PING);
 				} catch {
 					this.#remove(client);
 				}
@@ -88,7 +79,7 @@ export class SseHub {
 
 	/** Cierra todas las conexiones y detiene el heartbeat (al parar el servicio). */
 	stop(): void {
-		if (this.#heartbeat) clearInterval(this.#heartbeat);
+		this.#heartbeat?.stop();
 		this.#heartbeat = null;
 		for (const set of this.#byUser.values()) {
 			for (const client of set) {

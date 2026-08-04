@@ -6,7 +6,6 @@
 	"kernelMode": 80,
 	"failOnError": false,
 	"private": {
-		"dbName": "${NOTIFICATIONS_DB_NAME:-adc-notifications}",
 		"retentionDays": "${NOTIFICATIONS_RETENTION_DAYS:-365}",
 		"systemFrom": "${NOTIFICATIONS_SYSTEM_FROM:-no-reply@adigitalcafe.com}"
 	},
@@ -16,7 +15,11 @@
 			"version": "latest",
 			"language": "typescript",
 			"custom": {
-				"uri": "mongodb://admin:password@localhost:27017/adc-core?authSource=admin",
+				"host": "${MONGO_HOST:-localhost:27017}",
+				"user": "${MONGO_USER:-admin}",
+				"password": "${MONGO_PASSWORD:-password}",
+				"options": "${MONGO_OPTIONS:-authSource=admin}",
+				"db": "${NOTIFICATIONS_DB_NAME:-adc-notifications}",
 				"maxRetries": 5,
 				"retryDelay": 5000
 			}
@@ -31,7 +34,7 @@
 			"version": "latest",
 			"language": "typescript",
 			"custom": {
-				"url": "amqp://admin:password@localhost:5672",
+				"url": "${RABBITMQ_URL:-amqp://admin:password@localhost:5672}",
 				"defaultPrefetch": 10,
 				"defaultConcurrency": 5,
 				"maxRetries": 4,
