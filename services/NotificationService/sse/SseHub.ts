@@ -12,6 +12,13 @@ interface SseClient {
 }
 
 /**
+ * Máximo de conexiones SSE simultáneas por usuario. La ruta secuestra el socket y no
+ * pasa por el rate-limiter, así que sin este tope una sola cuenta podía abrir conexiones
+ * sin límite hasta agotar los descriptores/memoria del servidor (DoS). Ver ADC-01.
+ */
+const MAX_CONNECTIONS_PER_USER = 10;
+
+/**
  * Registro en memoria de conexiones SSE por usuario y emisor de eventos. El transporte
  * (hijack, headers, heartbeat) vive en `@common/utils/sse`; acá queda sólo el índice por
  * usuario, que es lo propio de este servicio.
@@ -37,6 +44,19 @@ export class SseHub {
 		if (!set) {
 			set = new Set();
 			this.#byUser.set(userId, set);
+		}
+		// Tope por usuario: al superarlo se cierra la conexión más antigua (el Set conserva
+		// orden de inserción). Una pestaña nueva legítima sigue funcionando; un abuso no
+		// acumula conexiones. Ver ADC-01.
+		while (set.size >= MAX_CONNECTIONS_PER_USER) {
+			const oldest = set.values().next().value as SseClient | undefined;
+			if (!oldest) break;
+			this.#remove(oldest);
+			try {
+				oldest.conn.close();
+			} catch {
+				/* noop: cerrar dispara el onClose, que ya invoca el disposer de esa conexión */
+			}
 		}
 		set.add(client);
 		this.#logger.logDebug(`SSE: cliente conectado (${userId}); total usuario=${set.size}`);

@@ -1,7 +1,7 @@
 import type { IHostBasedHttpProvider, FastifyRequest, FastifyReply } from "@interfaces/modules/providers/IHttpServer.d.ts";
 import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
 import type { ILogger } from "@interfaces/utils/ILogger.d.ts";
-import { createCorsOriginGuard } from "@providers/http/fastify-server/security/index.js";
+import { isPlatformOrigin } from "@providers/http/fastify-server/security/index.js";
 import { openSseStream, sseEvent, type RawRequestSource } from "@common/utils/sse.ts";
 import type { RawResponseSink } from "@common/utils/http-stream.ts";
 import type { SseHub } from "./SseHub.ts";
@@ -31,16 +31,9 @@ export function registerSseRoute(deps: SseRouteDeps): void {
 	// El stream se sirve sobre el socket crudo (hijack), saltándose el hook de
 	// `@fastify/cors`; replicamos la MISMA política de orígenes del provider para
 	// que un EventSource cross-origin (apps en otros puertos en dev) reciba CORS.
-	const isDev = process.env.NODE_ENV !== "production";
-	const corsGuard = createCorsOriginGuard(isDev, () => httpProvider.getRegisteredHosts());
 	const corsHeadersFor = (origin: string | undefined): Record<string, string> => {
-		if (!origin) return {};
-		let allow = false;
-		corsGuard(origin, (_e, ok) => {
-			allow = !!ok;
-		});
-		if (!allow) return {};
-		return { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", Vary: "Origin" };
+		if (!isPlatformOrigin(origin, httpProvider.getRegisteredHosts())) return {};
+		return { "Access-Control-Allow-Origin": origin!, "Access-Control-Allow-Credentials": "true", Vary: "Origin" };
 	};
 
 	httpProvider.registerRoute("GET", SSE_PATH, async (req: FastifyRequest, reply: FastifyReply) => {
