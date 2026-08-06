@@ -86,6 +86,18 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	// Alerta interna para el equipo (mismos destinatarios): se desplegó una versión nueva de los
+	// Términos o de la Política de Privacidad. Los Términos obligan a anunciar con antelación los
+	// cambios que reducen beneficios, y la constancia de aceptación queda ligada a la versión: sin
+	// este aviso el cambio entra en vigor y nadie se acuerda de comunicarlo. Las versiones viajan
+	// en `data`.
+	"security.legal_docs_updated": {
+		title: "Cambió un documento legal de la plataforma",
+		body: "Se publicó una versión nueva de los Términos o de la Política de Privacidad. Falta anunciarla a las personas usuarias.",
+		linkApp: "modules",
+		link: "/",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 };
 
 /** Prefijos reservados: todo topic bajo estos namespaces DEBE tener plantilla declarada. */

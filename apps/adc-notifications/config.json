@@ -24,7 +24,8 @@
 			}
 		],
 		"federationExposes": {
-			"./NotificationsMenu": "./src/federated/notifications-menu.tsx"
+			"./NotificationsMenu": "./src/federated/notifications-menu.tsx",
+			"./AccountSettings": "./src/components/AccountSettings.tsx"
 		}
 	},
 	"services": [
