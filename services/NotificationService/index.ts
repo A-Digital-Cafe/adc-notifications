@@ -8,13 +8,14 @@ import { forEachPage } from "@common/utils/batch.ts";
 import type { IIdentityManagerService } from "@common/types/identity/IIdentityManagerService.js";
 import { EnableEndpoints, DisableEndpoints } from "@services/core/EndpointManagerService/index.js";
 import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
-import type { INotificationService, INotificationEmailSender } from "@common/types/notifications/INotificationService.ts";
+import type { INotificationService, INotificationEmailSender, SegmentDispatchResult } from "@common/types/notifications/INotificationService.ts";
 import type {
 	BroadcastInput,
 	Notification,
 	NotificationPreference,
 	NotificationTopic,
 	NotifyInput,
+	SegmentInput,
 } from "@common/types/notifications/Notification.ts";
 import { mandatoryChannelsFor } from "@common/utils/notifications/platform-topics.ts";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
@@ -46,6 +47,13 @@ interface BroadcastJob extends BroadcastInput {
 	cursor?: string | null;
 	/** Usuarios alcanzados por los chunks anteriores. */
 	delivered?: number;
+	/**
+	 * Audiencia explícita de este chunk (envío a subconjunto). Presente ⇒ el job entrega
+	 * esos ids y termina, sin cursor ni re-publicación. Va **dentro de la firma**: si el
+	 * HMAC no cubriera la audiencia, un job inyectado en la cola podría redirigir el aviso
+	 * a otros destinatarios, que es justo contra lo que existe la firma.
+	 */
+	userIds?: string[] | null;
 	/** HMAC-SHA256 (hex) del payload canónico. */
 	sig?: string;
 }
@@ -181,6 +189,38 @@ export default class NotificationService extends BaseService implements INotific
 		return "direct";
 	}
 
+	/**
+	 * Anuncio a la audiencia enumerada. Mismo scope que `broadcast`: quien puede anunciarle a
+	 * todos puede anunciarle a un subconjunto, así que no hace falta un scope nuevo.
+	 *
+	 * Trocea la audiencia y publica **un job firmado por chunk** (payload acotado, reintento
+	 * reanudable por sí mismo, sin cursor). El dedup por `(userId, broadcastId)` hace idempotente
+	 * el reintento, así que un `broadcastId` determinista permite reenviar sin duplicar.
+	 */
+	async notifySegment(cap: CapabilityToken, input: SegmentInput): Promise<SegmentDispatchResult> {
+		assertScope(cap, Scope.NotificationsBroadcast);
+		if (!input.broadcastId) throw new NotificationError(400, "MISSING_FIELDS", "broadcastId requerido");
+		const userIds = [...new Set(input.userIds ?? [])].filter(Boolean);
+		if (userIds.length === 0) throw new NotificationError(400, "MISSING_FIELDS", "userIds vacío: no hay a quién avisar");
+
+		const { userIds: _audience, ...announcement } = input;
+		if (this.#rabbit && this.#broadcastKey) {
+			for (let i = 0; i < userIds.length; i += BROADCAST_CHUNK) {
+				await this.#publishBroadcastJob({ ...announcement, userIds: userIds.slice(i, i + BROADCAST_CHUNK), delivered: 0 });
+			}
+			return { mode: "queued", recipients: userIds.length };
+		}
+
+		const failedUserIds: string[] = [];
+		for (let i = 0; i < userIds.length; i += BROADCAST_CHUNK) {
+			failedUserIds.push(...(await this.#deliverBroadcastPage(announcement, userIds.slice(i, i + BROADCAST_CHUNK))));
+		}
+		if (failedUserIds.length > 0) {
+			this.logger.logWarn(`segmento ${input.broadcastId} (directo): ${failedUserIds.length}/${userIds.length} entregas fallaron`);
+		}
+		return { mode: "direct", recipients: userIds.length - failedUserIds.length, failedUserIds };
+	}
+
 	// ─── Fan-out de broadcasts ──────────────────────────────────────────────
 	/** Payload canónico de la firma: los campos que definen el anuncio y su progreso. */
 	#broadcastPayload(job: BroadcastJob): string {
@@ -195,6 +235,7 @@ export default class NotificationService extends BaseService implements INotific
 			job.data ?? null,
 			job.cursor ?? null,
 			job.delivered ?? 0,
+			job.userIds ?? null,
 		]);
 	}
 
@@ -224,10 +265,12 @@ export default class NotificationService extends BaseService implements INotific
 		const total = await forEachPage(
 			async (afterId, limit) => (await this.#fetchUserIdsPage(afterId, limit)).map((id) => ({ id })),
 			async (page) => {
-				failed += await this.#deliverBroadcastPage(
-					input,
-					page.map((u) => u.id)
-				);
+				failed += (
+					await this.#deliverBroadcastPage(
+						input,
+						page.map((u) => u.id)
+					)
+				).length;
 			},
 			BROADCAST_CHUNK
 		);
@@ -248,11 +291,17 @@ export default class NotificationService extends BaseService implements INotific
 			);
 			return;
 		}
+		// Audiencia explícita: este chunk es autosuficiente y no continúa el fan-out.
+		if (job.userIds) {
+			const failed = await this.#deliverBroadcastPage(job, job.userIds);
+			if (failed.length > 0) throw new Error(`segmento ${job.broadcastId}: ${failed.length}/${job.userIds.length} entregas fallaron en el chunk`);
+			return;
+		}
 		const ids = await this.#fetchUserIdsPage(job.cursor ?? null, BROADCAST_CHUNK);
 		const delivered = (job.delivered ?? 0) + ids.length;
 		if (ids.length > 0) {
 			const failed = await this.#deliverBroadcastPage(job, ids);
-			if (failed > 0) throw new Error(`broadcast ${job.broadcastId}: ${failed}/${ids.length} entregas fallaron en el chunk`);
+			if (failed.length > 0) throw new Error(`broadcast ${job.broadcastId}: ${failed.length}/${ids.length} entregas fallaron en el chunk`);
 		}
 		if (ids.length === BROADCAST_CHUNK) {
 			await this.#publishBroadcastJob({ ...job, cursor: ids.at(-1), delivered });
@@ -261,8 +310,13 @@ export default class NotificationService extends BaseService implements INotific
 		}
 	}
 
-	/** Entrega una página del broadcast; devuelve cuántas entregas fallaron. */
-	async #deliverBroadcastPage(input: BroadcastInput, userIds: string[]): Promise<number> {
+	/**
+	 * Entrega una página del broadcast; devuelve **quiénes** fallaron, no cuántos.
+	 *
+	 * La lista importa donde el aviso es una obligación (un incidente de datos): el productor tiene
+	 * que poder asentar el resultado por persona y reintentar sólo con quien quedó sin alcanzar.
+	 */
+	async #deliverBroadcastPage(input: BroadcastInput, userIds: string[]): Promise<string[]> {
 		const results = await Promise.allSettled(
 			userIds.map((userId) =>
 				this.#deliver(
@@ -281,7 +335,7 @@ export default class NotificationService extends BaseService implements INotific
 				)
 			)
 		);
-		return results.filter((r) => r.status === "rejected").length;
+		return userIds.filter((_, i) => results[i].status === "rejected");
 	}
 
 	/** Página de IDs de usuarios activos (`id > afterId`, ascendente) vía identity interna. */
