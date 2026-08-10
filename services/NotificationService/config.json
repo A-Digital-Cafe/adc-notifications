@@ -7,7 +7,9 @@
 	"failOnError": false,
 	"private": {
 		"retentionDays": "${NOTIFICATIONS_RETENTION_DAYS:-365}",
-		"systemFrom": "${NOTIFICATIONS_SYSTEM_FROM:-no-reply@adigitalcafe.com}"
+		"systemFrom": "${NOTIFICATIONS_SYSTEM_FROM:-no-reply@adigitalcafe.com}",
+		"preferencesUrl": "${NOTIFICATIONS_PREFERENCES_URL:-https://my-account.adigitalcafe.com/}",
+		"unsubscribeUrl": "${NOTIFICATIONS_UNSUBSCRIBE_URL:-https://my-account.adigitalcafe.com/api/notifications/unsubscribe}"
 	},
 	"providers": [
 		{

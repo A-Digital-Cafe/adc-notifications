@@ -7,15 +7,22 @@ import { NOTIFY_SERVICE, NOTIFY_OPERATION, NOTIFY_BROADCAST_OPERATION } from "@c
 import { forEachPage } from "@common/utils/batch.ts";
 import type { IIdentityManagerService } from "@common/types/identity/IIdentityManagerService.js";
 import { EnableEndpoints, DisableEndpoints } from "@services/core/EndpointManagerService/index.js";
-import { OnlyKernel } from "@adc/utils/decorators/OnlyKernel.ts";
 import type { ISessionVerifier } from "@common/types/identity/SessionVerifier.ts";
 import type { INotificationService, INotificationEmailSender } from "@common/types/notifications/INotificationService.ts";
-import type { BroadcastInput, Notification, NotificationPreference, NotifyInput } from "@common/types/notifications/Notification.ts";
+import type {
+	BroadcastInput,
+	Notification,
+	NotificationPreference,
+	NotificationTopic,
+	NotifyInput,
+} from "@common/types/notifications/Notification.ts";
+import { mandatoryChannelsFor } from "@common/utils/notifications/platform-topics.ts";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
 import { assertScope, Scope, Capability, type CapabilityToken } from "@common/security/Capability.ts";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { notificationSchema, notificationSecretSchema, preferenceSchema, type NotificationSecret } from "./domain/index.ts";
+import { createUnsubscribeToken, verifyUnsubscribeToken } from "./domain/unsubscribeToken.ts";
 import { NotificationManager, PreferenceManager } from "./dao/index.ts";
 import { SYSTEM_TOPIC_TEMPLATES, isReservedTopic, RateLimiter } from "./policy.ts";
 import { SseHub } from "./sse/SseHub.ts";
@@ -60,8 +67,12 @@ export default class NotificationService extends BaseService implements INotific
 	#hub: SseHub | null = null;
 	/** Secreto HMAC (persistido en mongo) con el que se firman los jobs de broadcast. */
 	#broadcastKey: Buffer | null = null;
+	/** Secreto HMAC de los enlaces de baja. Separado del anterior: distinto uso, distinta rotación. */
+	#unsubscribeKey: Buffer | null = null;
 
 	#systemFrom = "no-reply@adigitalcafe.com";
+	#preferencesUrl = "https://my-account.adigitalcafe.com/";
+	#unsubscribeUrl = "";
 	#retentionDays = 90;
 	#purgeTimer: NodeJS.Timeout | null = null;
 
@@ -82,6 +93,8 @@ export default class NotificationService extends BaseService implements INotific
 
 		const priv = (this.config?.private ?? {}) as Record<string, string | undefined>;
 		this.#systemFrom = priv.systemFrom || this.#systemFrom;
+		this.#preferencesUrl = priv.preferencesUrl || this.#preferencesUrl;
+		this.#unsubscribeUrl = priv.unsubscribeUrl || "";
 		this.#retentionDays = Number(priv.retentionDays || 90) || 90;
 
 		// La base ya es la propia del servicio: la elige el `db` del provider en config.json.
@@ -92,14 +105,19 @@ export default class NotificationService extends BaseService implements INotific
 		this.#preferences = new PreferenceManager(PreferenceModel);
 		this.#hub = new SseHub(this.logger);
 
-		// Secreto de firma de broadcasts: se crea una sola vez y persiste entre reinicios.
+		// Secretos de firma: se crean una sola vez y persisten entre reinicios. Uno por uso —
+		// rotar el de los enlaces de baja no debe invalidar los broadcasts en vuelo, ni al revés.
 		const SecretModel = this.#mongo.createModel<NotificationSecret>("notification_secrets", notificationSecretSchema);
-		const secret = await SecretModel.findOneAndUpdate(
-			{ _id: "broadcast-hmac" },
-			{ $setOnInsert: { key: randomBytes(32).toString("hex"), createdAt: new Date() } },
-			{ upsert: true, new: true }
-		).lean();
-		this.#broadcastKey = secret ? Buffer.from(secret.key, "hex") : null;
+		const loadSecret = async (id: string): Promise<Buffer | null> => {
+			const row = await SecretModel.findOneAndUpdate(
+				{ _id: id },
+				{ $setOnInsert: { key: randomBytes(32).toString("hex"), createdAt: new Date() } },
+				{ upsert: true, new: true }
+			).lean();
+			return row ? Buffer.from(row.key, "hex") : null;
+		};
+		this.#broadcastKey = await loadSecret("broadcast-hmac");
+		this.#unsubscribeKey = await loadSecret("unsubscribe-hmac");
 
 		// Endpoint SSE sobre el socket crudo (no encaja en @RegisterEndpoint).
 		const httpProvider = this.getMyProvider<IHostBasedHttpProvider>("fastify-server");
@@ -396,15 +414,54 @@ export default class NotificationService extends BaseService implements INotific
 	}
 
 	/**
-	 * Purga en cascada las notificaciones y preferencias de un usuario tras expirar
-	 * su retención (invocado por IIdentityManagerService). Protegido por `@OnlyKernel()`.
+	 * Export de la bandeja y las preferencias (derecho de acceso, art. 14 Ley 25.326 / art. 15
+	 * RGPD). Espejo del contrato de purga, con el caller probando `identity:internal`. Acotado a
+	 * las 1000 más recientes, y el JSON lo declara.
 	 */
-	@OnlyKernel()
-	async purgeUserData(_kernelKey: symbol, userId: string): Promise<void> {
+	async exportUserData(cap: CapabilityToken, userId: string): Promise<unknown> {
+		assertScope(cap, Scope.IdentityInternal);
+		if (!userId) return { notifications: [], preferences: [] };
+		const max = 1000;
+		const items = await this.notifications.exportByUser(userId, max);
+		const preferences = (await this.preferences.list(userId)).map((p) => ({
+			topic: p.topic,
+			inApp: p.inApp,
+			email: p.email,
+			push: p.push,
+			updatedAt: p.updatedAt,
+		}));
+		return {
+			notifications: items.map((n) => ({
+				id: n.id,
+				topic: n.topic,
+				title: n.title,
+				body: n.body,
+				link: n.link ?? null,
+				linkApp: n.linkApp ?? null,
+				data: n.data ?? null,
+				channels: n.channels,
+				readAt: n.readAt ?? null,
+				createdAt: n.createdAt,
+			})),
+			preferences,
+			truncated: items.length >= max,
+			note: {
+				es: `Se exportan hasta ${max} notificaciones (las más recientes) y todas las preferencias por tema.`,
+				en: `Up to ${max} notifications are exported (most recent) plus all per-topic preferences.`,
+			},
+		};
+	}
+
+	/**
+	 * Purga la bandeja y las preferencias tras la baja (cascada de Identity, scope
+	 * `identity:internal`). Idempotente: un fallo lanza y el stepper reintenta sin efectos dobles.
+	 */
+	async purgeUserData(cap: CapabilityToken, userId: string): Promise<void> {
+		assertScope(cap, Scope.IdentityInternal);
 		if (!userId) return;
-		const removed = await this.notifications.purgeByUser(userId).catch(() => 0);
-		await this.preferences.purgeByUser(userId).catch(() => 0);
-		this.logger.logInfo(`Purga notificaciones: usuario ${userId} → ${removed} notificación(es) eliminadas`);
+		const removed = await this.notifications.purgeByUser(userId);
+		const prefs = await this.preferences.purgeByUser(userId);
+		this.logger.logInfo(`Purga notificaciones: usuario ${userId} → ${removed} notificación(es) y ${prefs} preferencia(s) eliminadas`);
 	}
 
 	// ─── Internos ───────────────────────────────────────────────────────────
@@ -444,10 +501,62 @@ export default class NotificationService extends BaseService implements INotific
 		const email = await this.#resolveUserEmail(input.userId);
 		if (!email) return;
 		const subject = input.email?.subject ?? input.title;
-		const html = input.email?.html ?? this.#defaultEmailHtml(input);
+		// El pie de baja va SIEMPRE, también sobre html custom del productor: /privacy
+		// promete que cada envío incluye cómo darse de baja.
+		const html = (input.email?.html ?? this.#defaultEmailHtml(input)) + this.#emailFooter(input.topic);
 		// `userId` deja que el EmailService entregue en el buzón de la plataforma
 		// cuando el envío a direcciones externas está deshabilitado.
-		await sender.sendSystemEmail({ to: email, userId: input.userId, subject, html, text: input.body });
+		await sender.sendSystemEmail({
+			to: email,
+			userId: input.userId,
+			subject,
+			html,
+			text: input.body,
+			headers: this.#unsubscribeHeaders(input.userId, input.topic),
+		});
+	}
+
+	/**
+	 * `List-Unsubscribe` (RFC 2369) + `List-Unsubscribe-Post` (RFC 8058): pone la baja en el
+	 * botón nativo del cliente de correo, además del pie. Ganancia real de deliverability y,
+	 * sobre todo, la forma menos hostil de ofrecerla.
+	 *
+	 * Se omiten cuando el email es un canal **obligatorio** del topic: anunciar una baja que
+	 * el `PreferenceManager` va a ignorar es peor que no ofrecerla. Y también sin
+	 * `unsubscribeUrl` configurada, porque la cabecera exige un URI absoluto y uno relativo
+	 * no lo es.
+	 */
+	#unsubscribeHeaders(userId: string, topic: string): Record<string, string> | undefined {
+		if (!this.#unsubscribeUrl || !this.#unsubscribeKey) return undefined;
+		if (mandatoryChannelsFor(topic).includes("email")) return undefined;
+
+		const token = createUnsubscribeToken({ userId, topic }, this.#unsubscribeKey);
+		const sep = this.#unsubscribeUrl.includes("?") ? "&" : "?";
+		return {
+			"List-Unsubscribe": `<${this.#unsubscribeUrl}${sep}token=${token}>`,
+			"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+		};
+	}
+
+	/**
+	 * Aplica un enlace de baja: apaga el canal email del topic firmado en el token.
+	 * Devuelve el topic dado de baja, o `null` si el token no verifica o venció.
+	 *
+	 * Es idempotente a propósito: los clientes de correo reintentan el POST y una segunda
+	 * baja del mismo topic tiene que responder lo mismo que la primera.
+	 */
+	async applyUnsubscribeToken(token: string): Promise<string | null> {
+		if (!this.#unsubscribeKey) return null;
+		const payload = verifyUnsubscribeToken(token, this.#unsubscribeKey);
+		if (!payload) return null;
+		await this.preferences.set(payload.userId, payload.topic as NotificationTopic, { email: false });
+		this.logger.logInfo(`Baja por List-Unsubscribe: topic ${payload.topic}`);
+		return payload.topic;
+	}
+
+	/** Página a la que se manda a quien abre el enlace de baja en el navegador. */
+	get preferencesUrl(): string {
+		return this.#preferencesUrl;
 	}
 
 	async #resolveUserEmail(userId: string): Promise<string | null> {
@@ -466,6 +575,17 @@ export default class NotificationService extends BaseService implements INotific
 			? `<p><a href="${input.link}" style="display:inline-block;padding:10px 16px;background:#5b5bd6;color:#fff;border-radius:8px;text-decoration:none">Ver</a></p>`
 			: "";
 		return `<div style="font-family:system-ui,sans-serif"><h2>${safe(input.title)}</h2><p>${safe(input.body)}</p>${cta}</div>`;
+	}
+
+	/** Pie con el topic que originó el envío y el enlace a preferencias (cómo darse de baja). */
+	#emailFooter(topic: string): string {
+		const safe = (s: string) => s.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c] ?? c);
+		return (
+			`<div style="font-family:system-ui,sans-serif;margin-top:24px;padding-top:12px;border-top:1px solid #ddd;font-size:12px;color:#666">` +
+			`<p>Recibís este correo por la categoría <code>${safe(topic)}</code> de tus notificaciones. ` +
+			`Podés ajustarla o darte de baja de estos avisos en <a href="${this.#preferencesUrl}">tus preferencias de notificación</a>.</p>` +
+			`</div>`
+		);
 	}
 
 	/** Declara la topología durable y consume los mensajes encolados por los productores. */

@@ -24,3 +24,12 @@ export const SetPreferenceBody = Type.Object({
 });
 
 export const SetPreferenceResponse = PreferenceObject;
+
+export const UnsubscribeQuery = Type.Object({
+	token: Type.Optional(Type.String({ description: "Token firmado del enlace de baja del correo" })),
+});
+
+export const UnsubscribeResponse = Type.Object({
+	unsubscribed: Type.Boolean(),
+	topic: Type.Union([Type.String(), Type.Null()], { description: "Topic dado de baja; null si el token no era válido" }),
+});

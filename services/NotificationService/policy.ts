@@ -29,6 +29,33 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/settings/privacy-security",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	// El aviso sale al MOMENTO del pedido, cuando la casilla registrada todavía es la
+	// vieja: es la ventana de reacción ante un pedido hostil con sesión robada. La
+	// casilla nueva enmascarada viaja en `data` (nunca en el texto: anti-phishing).
+	"security.email_change_requested": {
+		title: "Pediste cambiar el email de tu cuenta",
+		body: "Enviamos un enlace de confirmación a la casilla nueva. Si no fuiste vos, cambiá tu contraseña y contactá a soporte de inmediato.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["IdentityManagerService"],
+	},
+	"security.email_changed": {
+		title: "El email de tu cuenta fue cambiado",
+		body: "Si no fuiste vos, contactá a soporte de inmediato.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["IdentityManagerService"],
+	},
+	"security.username_changed": {
+		title: "Tu nombre de usuario fue cambiado",
+		body: "Si no fuiste vos, contactá a soporte de inmediato.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 	"security.new_login": {
 		title: "Nuevo inicio de sesión",
 		body: "Se detectó un inicio de sesión desde una IP nueva. Si no fuiste vos, cambiá tu contraseña.",

@@ -72,6 +72,15 @@ export class NotificationManager {
 		return this.#model.find(query).sort({ createdAt: -1 }).limit(limit).lean<Notification[]>();
 	}
 
+	/**
+	 * Notificaciones más recientes, acotadas a `max` (export de datos). No aplica el tope de la
+	 * bandeja (50): el export es un volcado único con su propio límite.
+	 */
+	async exportByUser(userId: string, max: number): Promise<Notification[]> {
+		if (!userId || max <= 0) return [];
+		return this.#model.find({ userId }).sort({ createdAt: -1 }).limit(max).lean<Notification[]>();
+	}
+
 	/** Notificaciones sin leer (readAt = null). */
 	async unreadCount(userId: string): Promise<number> {
 		return this.#model.countDocuments({ userId, readAt: null });

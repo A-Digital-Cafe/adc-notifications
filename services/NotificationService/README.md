@@ -9,6 +9,7 @@ base aislada `adc-notifications` (`notifications`, `notification_preferences`).
 - **Tiempo real**: SSE en `GET /api/notifications/stream` (auth por cookie de sesión; socket crudo con `reply.hijack()`).
 - **REST**: `GET /api/notifications`, `GET .../unread-count`, `POST .../:id/read`, `POST .../read-all`, `DELETE .../:id`, `GET|PUT .../preferences[/:topic]`.
 - **Preferencias**: una fila por `(userId, topic)`; sin fila → `DEFAULT_CHANNELS` (`@common/types/notifications`).
-- **Retención**: purga automática diaria de leídas > `NOTIFICATIONS_RETENTION_DAYS`. `purgeUserData` para borrado en cascada.
+- **Baja en un clic**: todo email lleva pie con el topic y `List-Unsubscribe`/`List-Unsubscribe-Post` (RFC 8058) si `NOTIFICATIONS_UNSUBSCRIBE_URL` apunta al `POST /api/notifications/unsubscribe` público. Autoriza un token HMAC del enlace, no la sesión; el GET sólo redirige a preferencias (un prefetch no debe dar de baja). Se omite en topics con `email` obligatorio.
+- **Retención**: purga automática diaria de leídas > `NOTIFICATIONS_RETENTION_DAYS`. `purgeUserData(cap, userId)` (scope `identity:internal`) borra bandeja + preferencias en la cascada de baja de cuenta de Identity; `exportUserData` (mismo handshake) las exporta para el export de datos.
 
 Dependencias y env: ver `config.json` y `.env.example`.
