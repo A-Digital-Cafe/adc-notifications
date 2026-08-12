@@ -20,7 +20,7 @@
 				"host": "${MONGO_HOST:-localhost:27017}",
 				"user": "${MONGO_USER:-admin}",
 				"password": "${MONGO_PASSWORD:-password}",
-				"options": "${MONGO_OPTIONS:-authSource=admin}",
+				"options": "${MONGO_OPTIONS:-replicaSet=rs0&authSource=admin}",
 				"db": "${NOTIFICATIONS_DB_NAME:-adc-notifications}",
 				"maxRetries": 5,
 				"retryDelay": 5000
@@ -47,7 +47,9 @@
 	"services": [
 		{ "name": "IdentityManagerService", "version": "latest" },
 		{ "name": "EndpointManagerService", "version": "latest" },
+		{ "name": "OperationsService", "version": "latest" },
 		{ "name": "SessionManagerService", "version": "latest", "optional": true },
+		{ "name": "ClusterService", "version": "latest", "optional": true },
 		{ "name": "EmailService", "version": "latest", "optional": true }
 	]
 }

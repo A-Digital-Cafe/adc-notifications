@@ -16,6 +16,7 @@ import type {
 	NotificationTopic,
 	NotifyInput,
 	SegmentInput,
+	NotificationStreamEvent,
 } from "@common/types/notifications/Notification.ts";
 import { mandatoryChannelsFor } from "@common/utils/notifications/platform-topics.ts";
 import { NotificationError } from "@common/types/custom-errors/NotificationError.ts";
@@ -26,7 +27,10 @@ import { notificationSchema, notificationSecretSchema, preferenceSchema, type No
 import { createUnsubscribeToken, verifyUnsubscribeToken } from "./domain/unsubscribeToken.ts";
 import { NotificationManager, PreferenceManager } from "./dao/index.ts";
 import { SYSTEM_TOPIC_TEMPLATES, isReservedTopic, RateLimiter } from "./policy.ts";
-import { SseHub } from "./sse/SseHub.ts";
+import type { IClusterService } from "@common/types/cluster/ICluster.ts";
+import type { IOperationsService } from "@common/types/operations/IOperationsService.ts";
+import { createConnectionAffinity } from "@common/utils/connection-affinity.ts";
+import { SseHub, SSE_AFFINITY_TTL_SECONDS } from "./sse/SseHub.ts";
 import { registerSseRoute } from "./sse/registerSseRoute.ts";
 import { NotificationEndpoints } from "./endpoints/notifications.ts";
 import { PreferenceEndpoints } from "./endpoints/preferences.ts";
@@ -58,6 +62,9 @@ interface BroadcastJob extends BroadcastInput {
 	sig?: string;
 }
 
+/** Topic del bus con el que un nodo le pasa a los demás un evento SSE para sus conexiones. */
+const CLUSTER_SSE_TOPIC = "notifications.sse";
+
 /**
  * Servicio de notificaciones: bandeja por usuario (Mongo, base `adc-notifications`),
  * preferencias por topic/canal, entrega en tiempo real por SSE y canal email
@@ -73,6 +80,7 @@ export default class NotificationService extends BaseService implements INotific
 	#notifications: NotificationManager | null = null;
 	#preferences: PreferenceManager | null = null;
 	#hub: SseHub | null = null;
+	#unsubscribeCluster: (() => void) | null = null;
 	/** Secreto HMAC (persistido en mongo) con el que se firman los jobs de broadcast. */
 	#broadcastKey: Buffer | null = null;
 	/** Secreto HMAC de los enlaces de baja. Separado del anterior: distinto uso, distinta rotación. */
@@ -111,7 +119,12 @@ export default class NotificationService extends BaseService implements INotific
 
 		this.#notifications = new NotificationManager(NotificationModel);
 		this.#preferences = new PreferenceManager(PreferenceModel);
-		this.#hub = new SseHub(this.logger);
+		// El hub publica en qué nodo está conectado cada usuario, pero NO se registra un extractor
+		// de afinidad en el gateway: la entrega ya llega a cualquier nodo por el bus, y desviar el
+		// endpoint SSE sería cortar un stream establecido para reabrirlo al lado. La reclamación
+		// vale igual —para diagnóstico y para poder rutear algo puntual el día que haga falta—.
+		this.#hub = new SseHub(this.logger, createConnectionAffinity(this.#cluster(), SSE_AFFINITY_TTL_SECONDS));
+		this.#subscribeClusterStream();
 
 		// Secretos de firma: se crean una sola vez y persisten entre reinicios. Uno por uso —
 		// rotar el de los enlaces de baja no debe invalidar los broadcasts en vuelo, ni al revés.
@@ -156,6 +169,10 @@ export default class NotificationService extends BaseService implements INotific
 		await super.stop(kernelKey);
 		if (this.#purgeTimer) clearInterval(this.#purgeTimer);
 		this.#purgeTimer = null;
+		// Sin esto, un handler del bus seguiría vivo tras recargar el módulo y entregaría a un
+		// hub SSE ya descartado.
+		this.#unsubscribeCluster?.();
+		this.#unsubscribeCluster = null;
 		this.#broadcastKey = null;
 		this.#hub?.stop();
 		this.logger.logOk("NotificationService detenido");
@@ -413,7 +430,7 @@ export default class NotificationService extends BaseService implements INotific
 			if (!notification) return;
 			if (channels.includes("inApp")) {
 				const unread = await this.notifications.unreadCount(input.userId);
-				this.#hub?.publishToUser(input.userId, { type: "notification", unread, notification });
+				this.#emitToUser(input.userId, { type: "notification", unread, notification });
 			}
 		} else if (channels.includes("inApp")) {
 			// Digest: si ya hay una no leída del mismo topic, no apilamos otra.
@@ -421,7 +438,7 @@ export default class NotificationService extends BaseService implements INotific
 			if (!collapse) {
 				const notification = await this.notifications.create(input, channels);
 				const unread = await this.notifications.unreadCount(input.userId);
-				this.#hub?.publishToUser(input.userId, { type: "notification", unread, notification });
+				this.#emitToUser(input.userId, { type: "notification", unread, notification });
 			}
 		}
 
@@ -438,7 +455,7 @@ export default class NotificationService extends BaseService implements INotific
 	/** Marca una notificación como leída y sincroniza por SSE; `null` = ya no estaba. */
 	async markRead(userId: string, id: string): Promise<number | null> {
 		const unread = await this.notifications.markRead(userId, id);
-		if (unread !== null) this.#hub?.publishToUser(userId, { type: "read", unread });
+		if (unread !== null) this.#emitToUser(userId, { type: "read", unread });
 		return unread;
 	}
 
@@ -446,15 +463,49 @@ export default class NotificationService extends BaseService implements INotific
 	async deleteNotification(userId: string, id: string): Promise<number | null> {
 		const unread = await this.notifications.delete(userId, id);
 		// Reusa el evento "read": para las otras pestañas sólo importa el badge.
-		if (unread !== null) this.#hub?.publishToUser(userId, { type: "read", unread });
+		if (unread !== null) this.#emitToUser(userId, { type: "read", unread });
 		return unread;
 	}
 
 	/** Marca todas como leídas y sincroniza por SSE. Devuelve cuántas cambiaron. */
 	async markAllRead(userId: string): Promise<number> {
 		const changed = await this.notifications.markAllRead(userId);
-		if (changed > 0) this.#hub?.publishToUser(userId, { type: "read", unread: 0 });
+		if (changed > 0) this.#emitToUser(userId, { type: "read", unread: 0 });
 		return changed;
+	}
+
+	// ─── Entrega SSE entre nodos ────────────────────────────────────────────
+
+	/**
+	 * Entrega un evento a las conexiones SSE del usuario, **estén en el nodo que estén**.
+	 *
+	 * El hub SSE es por proceso: sólo conoce los sockets que sostiene este nodo. Con más de uno,
+	 * una notificación creada en el nodo A para alguien conectado al B se perdía en silencio —
+	 * el usuario la veía recién al recargar. Se entrega local y además se emite por el bus, donde
+	 * cada nodo la ofrece a SUS conexiones.
+	 *
+	 * El bus descarta el eco propio, así que el emisor no se entrega dos veces. Y como cada nodo
+	 * sólo entrega a quien tiene conectado, un evento para un usuario ausente no cuesta nada.
+	 */
+	#emitToUser(userId: string, event: NotificationStreamEvent): void {
+		this.#hub?.publishToUser(userId, event);
+		void this.#cluster()?.publish(CLUSTER_SSE_TOPIC, { userId, event });
+	}
+
+	/** Entrega local de lo que emitió otro nodo. */
+	#subscribeClusterStream(): void {
+		const cluster = this.#cluster();
+		if (!cluster) return;
+		this.#unsubscribeCluster?.();
+		this.#unsubscribeCluster = cluster.subscribe<{ userId: string; event: NotificationStreamEvent }>(CLUSTER_SSE_TOPIC, (msg) => {
+			const { userId, event } = msg.payload ?? {};
+			if (userId && event) this.#hub?.publishToUser(userId, event);
+		});
+	}
+
+	/** Opcional a propósito: sin clúster la entrega local sigue funcionando igual. */
+	#cluster(): IClusterService | undefined {
+		return this.tryGetMyService<IClusterService>("ClusterService");
 	}
 
 	// ─── Accesores para endpoints ───────────────────────────────────────────
@@ -573,7 +624,7 @@ export default class NotificationService extends BaseService implements INotific
 	/**
 	 * `List-Unsubscribe` (RFC 2369) + `List-Unsubscribe-Post` (RFC 8058): pone la baja en el
 	 * botón nativo del cliente de correo, además del pie. Ganancia real de deliverability y,
-	 * sobre todo, la forma menos hostil de ofrecerla.
+	 * la forma menos hostil de ofrecerla.
 	 *
 	 * Se omiten cuando el email es un canal **obligatorio** del topic: anunciar una baja que
 	 * el `PreferenceManager` va a ignorar es peor que no ofrecerla. Y también sin
@@ -669,14 +720,33 @@ export default class NotificationService extends BaseService implements INotific
 
 	#startPurgeScheduler(): void {
 		this.#purgeTimer = setInterval(() => {
-			void this.notifications
-				.purgeExpired(this.#retentionDays)
-				.then((n) => {
-					if (n > 0) this.logger.logDebug(`Purga notificaciones: ${n} leídas expiradas eliminadas`);
-				})
-				.catch((e) => this.logger.logWarn(`Purga notificaciones falló: ${(e as Error).message}`));
+			void this.#runPurge().catch((e) => this.logger.logWarn(`Purga notificaciones falló: ${(e as Error).message}`));
 		}, PURGE_INTERVAL_MS);
 		this.#purgeTimer.unref?.();
+	}
+
+	/**
+	 * Corre `fn` sólo en el nodo que tenga el lease. Sin `OperationsService` corre igual: en un
+	 * despliegue de un nodo negarse sería peor que el trabajo duplicado que evita.
+	 */
+	async #onlyOnLeader(name: string, ttlSeconds: number, fn: () => Promise<void>): Promise<void> {
+		const ops = this.tryGetMyService<IOperationsService>("OperationsService");
+		if (ops) await ops.withLeadership(name, ttlSeconds, fn);
+		else await fn();
+	}
+
+	/**
+	 * El barrido es un `deleteMany` idempotente: si corriera en varios nodos la segunda pasada
+	 * borraría cero filas, así que el lease no evita corrupción sino pagar el mismo escaneo de
+	 * la colección una vez por nodo.
+	 */
+	async #runPurge(): Promise<void> {
+		await this.#onlyOnLeader("notifications.purge", 3600, () => this.#purgeBatch());
+	}
+
+	async #purgeBatch(): Promise<void> {
+		const n = await this.notifications.purgeExpired(this.#retentionDays);
+		if (n > 0) this.logger.logDebug(`Purga notificaciones: ${n} leídas expiradas eliminadas`);
 	}
 
 	async #waitForMongo(): Promise<void> {
