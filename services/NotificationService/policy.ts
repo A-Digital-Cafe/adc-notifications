@@ -113,6 +113,18 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	// Alerta interna para el equipo (mismos destinatarios): un chequeo de integridad de la
+	// infraestructura pasó a fallar. Es el aviso que ningún healthcheck da — un almacenamiento con
+	// una copia faltante o un Redis que no puede volcar a disco responden verde desde afuera —, así
+	// que el texto empuja a mirar el informe y no a suponer que ya se está reintentando solo. Sale
+	// UNA vez, en el flanco: el detalle (chequeo, nodo, motivo) viaja en `data`.
+	"security.integrity_failed": {
+		title: "Fallo de integridad en la infraestructura",
+		body: "Un chequeo de integridad de la infraestructura pasó a fallar. Revisá el informe en el panel de red: no se repara solo.",
+		linkApp: "network",
+		link: "/",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 	// Alerta interna para el equipo (mismos destinatarios): se desplegó una versión nueva de los
 	// Términos o de la Política de Privacidad. Los Términos obligan a anunciar con antelación los
 	// cambios que reducen beneficios, y la constancia de aceptación queda ligada a la versión: sin
