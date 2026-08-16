@@ -45,7 +45,7 @@ export default function App() {
 	useEffect(() => {
 		let alive = true;
 		(async () => {
-			const session = await getSession(false, true);
+			const session = await getSession(false);
 			if (!alive) return;
 			if (!session.authenticated) {
 				setStatus("anon");
