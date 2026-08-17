@@ -56,6 +56,32 @@ export const SYSTEM_TOPIC_TEMPLATES: Readonly<Record<string, SystemTopicTemplate
 		link: "/settings/privacy-security",
 		allowedOrigins: ["IdentityManagerService"],
 	},
+	"security.two_factor_enabled": {
+		title: "Activaste la verificación en dos pasos",
+		body: "Guardá tus códigos de recuperación en un lugar seguro: son la única forma de entrar si perdés el autenticador.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["IdentityManagerService"],
+	},
+	"security.two_factor_disabled": {
+		title: "Desactivaste la verificación en dos pasos",
+		body: "Tu cuenta vuelve a entrar sólo con contraseña. Si no fuiste vos, cambiala y contactá a soporte de inmediato.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["IdentityManagerService"],
+	},
+	// Topic aparte del anterior: el texto lo fija esta plantilla, así que es la única forma de que
+	// el aviso diga que la baja NO la pidió el titular.
+	"security.two_factor_reset": {
+		title: "Un administrador reseteó tu verificación en dos pasos",
+		body: "Tu cuenta vuelve a entrar sólo con contraseña. Si no lo pediste, cambiá tu contraseña y contactá a soporte de inmediato.",
+		channels: ["inApp", "email"],
+		linkApp: "my-account",
+		link: "/settings/privacy-security",
+		allowedOrigins: ["IdentityManagerService"],
+	},
 	"security.new_login": {
 		title: "Nuevo inicio de sesión",
 		body: "Se detectó un inicio de sesión desde una IP nueva. Si no fuiste vos, cambiá tu contraseña.",
