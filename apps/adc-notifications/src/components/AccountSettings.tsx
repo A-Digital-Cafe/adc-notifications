@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { createAdcApi } from "@ui-library/utils/adc-fetch";
 import { PLATFORM_TOPIC_LIST } from "@common/utils/notifications/platform-topics.ts";
+// Se importa el CSS porque el panel se expone como remote y lo monta `my-account`, que no
+// escanea este árbol: sin esto sus clases Tailwind no existen allá.
+import "../styles/tailwind.css";
 
 /**
  * Panel de preferencias de los avisos **de plataforma**, expuesto como remote
@@ -10,7 +13,7 @@ import { PLATFORM_TOPIC_LIST } from "@common/utils/notifications/platform-topics
  * Los canales obligatorios de un topic (el aviso in-app de cambios legales) se pintan marcados y
  * deshabilitados, con el motivo a la vista. El backend los reimpone igual —el guard vive en
  * `PreferenceManager`—; acá se muestran así para que la restricción se entienda en vez de parecer
- * un bug cuando la casilla no responde.
+ * un bug cuando el interruptor no responde.
  */
 const api = createAdcApi({ basePath: "/api/notifications", devPort: 3000 });
 
@@ -68,7 +71,7 @@ export default function AccountSettings() {
 	if (!available) return null;
 
 	return (
-		<section className="rounded-xl bg-surface text-tsurface shadow-cozy ring-1 ring-black/5 p-5 mb-4">
+		<section className="rounded-xl bg-surface text-tsurface shadow-cozy border border-text/15 px-6 py-5 mb-4">
 			<h3 className="font-bold text-base mb-1">Plataforma</h3>
 			<p className="text-sm opacity-70 mb-4">Avisos que ADC manda a todas las personas usuarias.</p>
 			<ul className="divide-y divide-black/5">
@@ -86,19 +89,18 @@ export default function AccountSettings() {
 							{(Object.keys(CHANNEL_LABELS) as Channel[]).map((ch) => {
 								const locked = td.mandatoryChannels.includes(ch);
 								return (
-									<label
+									// `visualEnabled` con `disabled`: el canal obligatorio se ve encendido y opaco,
+									// no apagado ni gris, para que se lea como regla y no como control roto.
+									<adc-toggle
 										key={ch}
-										className={`flex items-center gap-1.5 text-xs ${locked ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
-										title={locked ? "Este aviso es obligatorio y no se puede desactivar" : undefined}
-									>
-										<input
-											type="checkbox"
-											checked={locked || valueOf(td.topic, ch)}
-											disabled={locked}
-											onChange={() => !locked && toggle(td.topic, ch)}
-										/>{" "}
-										{CHANNEL_LABELS[ch]}
-									</label>
+										size="small"
+										label={CHANNEL_LABELS[ch]}
+										checked={locked || valueOf(td.topic, ch)}
+										disabled={locked}
+										visualEnabled={locked}
+										hint={locked ? "Este aviso es obligatorio y no se puede desactivar" : undefined}
+										onadcChange={() => !locked && toggle(td.topic, ch)}
+									/>
 								);
 							})}
 						</div>
